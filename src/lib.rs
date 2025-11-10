@@ -10,7 +10,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const VERSION: u8 = 1;
 
-/// Domain seperation tag
+/// Domain separation tag
 pub const DST: &[u8] = b"rcan-1-delegation";
 
 /// A trait for types that define a capability.
