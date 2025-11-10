@@ -1,13 +1,11 @@
-use std::{
-    ops::Add,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::ops::Add;
 
 // TODO: better error management
 use anyhow::{bail, ensure, Context, Result};
 use ed25519_dalek::{
     ed25519::signature::Signer, Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH,
 };
+use n0_future::time::{Duration, SystemTime};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const VERSION: u8 = 1;
@@ -283,7 +281,7 @@ impl Expires {
     pub fn valid_for(duration: Duration) -> Self {
         Self::At(
             SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)
                 .expect("now is after UNIX_EPOCH")
                 .add(duration)
                 .as_secs(),
@@ -292,7 +290,7 @@ impl Expires {
 
     pub fn is_valid_at(&self, time: SystemTime) -> bool {
         let time = time
-            .duration_since(UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
             .expect("time must be after UNIX_EPOCH")
             .as_secs();
         match self {
@@ -420,7 +418,7 @@ mod test {
         let audience = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
         let rcan = Rcan::issuing_builder(&issuer, audience, Rpc::All)
             .sign(Expires::valid_for(Duration::from_secs(60)));
-        assert!(rcan.expires().is_valid_at(UNIX_EPOCH));
+        assert!(rcan.expires().is_valid_at(SystemTime::UNIX_EPOCH));
         let now = SystemTime::now();
         assert!(rcan.expires().is_valid_at(now));
         let future = now + Duration::from_secs(61);
