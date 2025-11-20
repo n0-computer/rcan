@@ -1,0 +1,48 @@
+name: wasm
+
+on:
+  pull_request:
+    types: ["labeled", "unlabeled", "opened", "synchronize", "reopened"]
+  merge_group:
+  push:
+    branches:
+      - main
+
+jobs:
+  wasm_check:
+    name: Build & check wasm32 for browsers
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Setup node.js version 22.5 # needed for browser-like websocket API support in node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.5
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install wasm-bindgen-test-runner
+        run: cargo binstall wasm-bindgen-cli --locked --no-confirm
+
+      - name: Install wasm-tools
+        uses: bytecodealliance/actions/wasm-tools/setup@v1
+
+      - name: wasm32 build
+        run: cargo build --target wasm32-unknown-unknown --all-features
+
+      # If the Wasm file contains any 'import "env"' declarations, then
+      # some non-Wasm-compatible code made it into the final code.
+      - name: Ensure no 'import "env"' in Wasm
+        run: |
+          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/iroh_n0des.wasm | grep 'import "env"'
