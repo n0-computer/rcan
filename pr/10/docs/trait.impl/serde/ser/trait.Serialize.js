@@ -1,0 +1,9 @@
+(function() {
+    var implementors = Object.fromEntries([["rcan",[["impl <a class=\"trait\" href=\"https://docs.rs/serde/1.0.217/serde/ser/trait.Serialize.html\" title=\"trait serde::ser::Serialize\">Serialize</a> for <a class=\"enum\" href=\"rcan/enum.CapabilityOrigin.html\" title=\"enum rcan::CapabilityOrigin\">CapabilityOrigin</a>"],["impl <a class=\"trait\" href=\"https://docs.rs/serde/1.0.217/serde/ser/trait.Serialize.html\" title=\"trait serde::ser::Serialize\">Serialize</a> for <a class=\"enum\" href=\"rcan/enum.Expires.html\" title=\"enum rcan::Expires\">Expires</a>"],["impl&lt;C&gt; <a class=\"trait\" href=\"https://docs.rs/serde/1.0.217/serde/ser/trait.Serialize.html\" title=\"trait serde::ser::Serialize\">Serialize</a> for <a class=\"struct\" href=\"rcan/struct.Payload.html\" title=\"struct rcan::Payload\">Payload</a>&lt;C&gt;<div class=\"where\">where\n    C: <a class=\"trait\" href=\"https://docs.rs/serde/1.0.217/serde/ser/trait.Serialize.html\" title=\"trait serde::ser::Serialize\">Serialize</a>,</div>"],["impl&lt;C&gt; <a class=\"trait\" href=\"https://docs.rs/serde/1.0.217/serde/ser/trait.Serialize.html\" title=\"trait serde::ser::Serialize\">Serialize</a> for <a class=\"struct\" href=\"rcan/struct.Rcan.html\" title=\"struct rcan::Rcan\">Rcan</a>&lt;C&gt;<div class=\"where\">where\n    C: <a class=\"trait\" href=\"https://docs.rs/serde/1.0.217/serde/ser/trait.Serialize.html\" title=\"trait serde::ser::Serialize\">Serialize</a>,</div>"]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":57,"fragment_lengths":[1420]}
