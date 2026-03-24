@@ -135,6 +135,8 @@ pub struct Payload<C> {
     capability: C,
     /// Valid until unix timestamp in seconds.
     valid_until: Expires,
+    /// Unix timestamp of token creation in seconds.
+    issued_at: u64,
 }
 
 impl<C> Payload<C> {
