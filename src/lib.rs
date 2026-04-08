@@ -254,6 +254,10 @@ impl<C> Rcan<C> {
         }
     }
 
+    pub fn issued_at(&self) -> u64 {
+        self.payload.issued_at
+    }
+
     pub fn expires(&self) -> &Expires {
         &self.payload.valid_until
     }
@@ -264,12 +268,17 @@ impl<C> RcanBuilder<'_, C> {
     where
         C: Serialize,
     {
+        let issued_at = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("now is after UNIX_EPOCH")
+                .as_secs();
         let payload = Payload {
             issuer: self.issuer.verifying_key(),
             audience: self.audience,
             capability_origin: self.capability_origin,
             capability: self.capability,
             valid_until,
+            issued_at,
         };
 
         let to_sign = postcard::to_extend(&payload, DST.to_vec()).expect("vec");
