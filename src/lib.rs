@@ -269,9 +269,16 @@ impl<C> RcanBuilder<'_, C> {
         C: Serialize,
     {
         let issued_at = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("now is after UNIX_EPOCH")
-                .as_secs();
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("now is after UNIX_EPOCH")
+            .as_secs();
+        self.sign_with_issued_at(valid_until, issued_at)
+    }
+
+    fn sign_with_issued_at(self, valid_until: Expires, issued_at: u64) -> Rcan<C>
+    where
+        C: Serialize,
+    {
         let payload = Payload {
             issuer: self.issuer.verifying_key(),
             audience: self.audience,
@@ -357,7 +364,7 @@ mod test {
         let issuer = SigningKey::from_bytes(&[0u8; 32]);
         let audience = SigningKey::from_bytes(&[1u8; 32]);
         let rcan = Rcan::issuing_builder(&issuer, audience.verifying_key(), Rpc::ReadWrite)
-            .sign(Expires::Never);
+            .sign_with_issued_at(Expires::Never, 0);
 
         println!("{}", hex::encode(rcan.encode()));
 
@@ -374,8 +381,10 @@ mod test {
             "01",
             // Expires::Never
             "00",
+            // issued_at: 0
+            "00",
             // Signature
-            "54675ed0b6ba3a830fe24ec8523f776fa43001edfe4cc9e3bd639009a2058b1805de5e05958b46c03b423ed5d1c72acaab48a9f3bf8db2402c82295f085df404",
+            "73d416f1bab926a865e7d83f0ba4f1ce817436f9cdaf92eba84205dc92b58b0e016a291ea4fc90f8772f81ef7c94b8c0897acc1456a593ed8f913ce1b5b4440f",
         ]
         .join("");
 
