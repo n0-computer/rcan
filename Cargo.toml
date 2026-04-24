@@ -13,6 +13,8 @@ rust-version = "1.81"
 [dependencies]
 anyhow = "1.0.95"
 blake3 = "1.5.5"
+data-encoding = "2"
+fastbloom = "0.17"
 derive_more = { version = "2.0.1", features = ["debug", "display"] }
 ed25519-dalek = { version = "3.0.0-pre.1", features = ["serde", "rand_core"] }
 hex = "0.4.3"
