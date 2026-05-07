@@ -13,7 +13,7 @@ rust-version = "1.81"
 [dependencies]
 anyhow = "1.0.95"
 derive_more = { version = "2.0.1", features = ["debug", "display"] }
-ed25519-dalek = { version = "3.0.0-pre.6", features = ["serde"] }
+ed25519-dalek = { version = "=3.0.0-pre.7", features = ["serde"] }
 hex = "0.4.3"
 n0-future = "0.3.0"
 postcard = { version = "1.1.1", features = ["use-std"] }
