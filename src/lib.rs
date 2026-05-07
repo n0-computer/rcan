@@ -13,6 +13,111 @@ pub const VERSION: u8 = 1;
 /// Domain separation tag
 pub const DST: &[u8] = b"rcan-1-delegation";
 
+/// Stable serde for [`VerifyingKey`].
+///
+/// Serializes as length-prefixed raw bytes for binary formats and as a
+/// lowercase hex string for human-readable formats. This keeps the wire
+/// format independent of the [`ed25519_dalek`] crate's own serde impl,
+/// which has changed across versions.
+mod verifying_key_serde {
+    use ed25519_dalek::VerifyingKey;
+    use serde::{de::Error, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        key: &VerifyingKey,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serdect::array::serialize_hex_lower_or_bin(key.as_bytes(), serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<VerifyingKey, D::Error> {
+        let mut buf = [0u8; 32];
+        serdect::array::deserialize_hex_or_bin(&mut buf, deserializer)?;
+        VerifyingKey::from_bytes(&buf).map_err(D::Error::custom)
+    }
+}
+
+/// Wire-format wrapper around an ed25519 [`Signature`] that serializes as
+/// a fixed-length tuple of `SIGNATURE_LENGTH` bytes (no length prefix in
+/// binary formats like postcard), and as a lowercase hex string in
+/// human-readable formats.
+struct SignatureWire([u8; SIGNATURE_LENGTH]);
+
+impl Serialize for SignatureWire {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.collect_str(&format_args!("{}", hex::encode(self.0)))
+        } else {
+            use serde::ser::SerializeTuple;
+            let mut tup = serializer.serialize_tuple(SIGNATURE_LENGTH)?;
+            for b in &self.0 {
+                tup.serialize_element(b)?;
+            }
+            tup.end()
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SignatureWire {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = SignatureWire;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "an ed25519 signature ({} bytes)", SIGNATURE_LENGTH)
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                let mut bytes = [0u8; SIGNATURE_LENGTH];
+                hex::decode_to_slice(v, &mut bytes).map_err(E::custom)?;
+                Ok(SignatureWire(bytes))
+            }
+
+            fn visit_bytes<E: serde::de::Error>(
+                self,
+                v: &[u8],
+            ) -> std::result::Result<Self::Value, E> {
+                if v.len() != SIGNATURE_LENGTH {
+                    return Err(E::invalid_length(v.len(), &self));
+                }
+                let mut bytes = [0u8; SIGNATURE_LENGTH];
+                bytes.copy_from_slice(v);
+                Ok(SignatureWire(bytes))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = [0u8; SIGNATURE_LENGTH];
+                for (i, slot) in bytes.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(SignatureWire(bytes))
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_str(V)
+        } else {
+            deserializer.deserialize_tuple(SIGNATURE_LENGTH, V)
+        }
+    }
+}
+
 /// A trait for types that define a capability.
 ///
 /// Capabilities can be compared using [`Capability::permits`], which determines
@@ -113,7 +218,7 @@ impl Authorizer {
 }
 
 /// A token for attenuated capability delegations
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rcan<C> {
     /// The actual content.
     pub payload: Payload<C>,
@@ -121,13 +226,63 @@ pub struct Rcan<C> {
     pub signature: Signature,
 }
 
+impl<C: Serialize> Serialize for Rcan<C> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeTuple;
+        let mut tup = serializer.serialize_tuple(2)?;
+        tup.serialize_element(&self.payload)?;
+        tup.serialize_element(&SignatureWire(self.signature.to_bytes()))?;
+        tup.end()
+    }
+}
+
+impl<'de, C: Deserialize<'de>> Deserialize<'de> for Rcan<C> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RcanVisitor<C>(std::marker::PhantomData<C>);
+
+        impl<'de, C: Deserialize<'de>> serde::de::Visitor<'de> for RcanVisitor<C> {
+            type Value = Rcan<C>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an rcan token (payload, signature)")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let payload: Payload<C> = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let SignatureWire(sig_bytes) = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                Ok(Rcan {
+                    payload,
+                    signature: Signature::from_bytes(&sig_bytes),
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(2, RcanVisitor::<C>(std::marker::PhantomData))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, derive_more::Debug, PartialEq, Eq)]
 pub struct Payload<C> {
     /// The issuer
     #[debug("{}", hex::encode(issuer))]
+    #[serde(with = "verifying_key_serde")]
     issuer: VerifyingKey,
     /// The intended audience
     #[debug("{}", hex::encode(audience))]
+    #[serde(with = "verifying_key_serde")]
     audience: VerifyingKey,
     /// The origin of the capability
     capability_origin: CapabilityOrigin,
@@ -153,7 +308,7 @@ pub enum CapabilityOrigin {
     /// The origin is the issuer itself
     Issuer,
     /// This is a delegation, with this key being the root of the delegation chain.
-    Delegation(VerifyingKey),
+    Delegation(#[serde(with = "verifying_key_serde")] VerifyingKey),
 }
 
 /// When an rcan expires
@@ -349,6 +504,10 @@ mod test {
             .sign(Expires::Never);
 
         println!("{}", hex::encode(rcan.encode()));
+        println!(
+            "{}",
+            hex::encode(postcard::to_allocvec(&rcan.signature).unwrap())
+        );
 
         let expected: String = [
             // Version
