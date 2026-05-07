@@ -13,12 +13,10 @@ pub const VERSION: u8 = 1;
 /// Domain separation tag
 pub const DST: &[u8] = b"rcan-1-delegation";
 
-/// Stable serde for [`VerifyingKey`].
-///
-/// Serializes as length-prefixed raw bytes for binary formats and as a
-/// lowercase hex string for human-readable formats. This keeps the wire
-/// format independent of the [`ed25519_dalek`] crate's own serde impl,
-/// which has changed across versions.
+/// Stable serde for [`VerifyingKey`]: length-prefixed bytes in binary
+/// formats, lowercase hex in human-readable ones. Goes through
+/// [`serdect`] for its constant-time hex codec, and pins the wire
+/// format independent of [`ed25519_dalek`]'s own serde impl.
 mod verifying_key_serde {
     use ed25519_dalek::VerifyingKey;
     use serde::{de::Error, Deserializer, Serializer};
