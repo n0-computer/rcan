@@ -237,14 +237,14 @@ impl<C: Serialize> Serialize for Rcan<C> {
     }
 }
 
-impl<'de, C: Deserialize<'de>> Deserialize<'de> for Rcan<C> {
+impl<'de, C: Deserialize<'de> + Serialize> Deserialize<'de> for Rcan<C> {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         struct RcanVisitor<C>(std::marker::PhantomData<C>);
 
-        impl<'de, C: Deserialize<'de>> serde::de::Visitor<'de> for RcanVisitor<C> {
+        impl<'de, C: Deserialize<'de> + Serialize> serde::de::Visitor<'de> for RcanVisitor<C> {
             type Value = Rcan<C>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -261,10 +261,18 @@ impl<'de, C: Deserialize<'de>> Deserialize<'de> for Rcan<C> {
                 let SignatureWire(sig_bytes) = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                Ok(Rcan {
+                let rcan = Rcan {
                     payload,
                     signature: Signature::from_bytes(&sig_bytes),
-                })
+                };
+
+                // Verify before yielding, so a deserialized `Rcan` is
+                // always signature checked. Without this, serde wire
+                // formats hand back an unverified token while only
+                // `decode` checks the signature.
+                rcan.verify_signature().map_err(serde::de::Error::custom)?;
+
+                Ok(rcan)
             }
         }
 
@@ -364,22 +372,27 @@ impl<C> Rcan<C> {
 
     pub fn decode(bytes: &[u8]) -> Result<Self>
     where
-        C: DeserializeOwned,
+        C: DeserializeOwned + Serialize,
     {
         let Some(version) = bytes.first() else {
             bail!("cannot decode, token is empty");
         };
         ensure!(*version == VERSION, "invalid version: {}", version);
+        // `Rcan`'s `Deserialize` verifies the signature, so a successful
+        // decode is already signature-checked.
         let rcan: Self = postcard::from_bytes(&bytes[1..]).context("decoding")?;
-
-        // Verify the signature
-        let mut signed = DST.to_vec();
-        signed.extend_from_slice(&bytes[1..bytes.len() - SIGNATURE_LENGTH]);
-        rcan.payload
-            .issuer
-            .verify_strict(&signed, &rcan.signature)?;
-
         Ok(rcan)
+    }
+
+    /// Verify the signature over the payload. The signed bytes are
+    /// `DST ++ postcard(payload)`, matching [`RcanBuilder::sign`].
+    fn verify_signature(&self) -> Result<()>
+    where
+        C: Serialize,
+    {
+        let signed = postcard::to_extend(&self.payload, DST.to_vec())?;
+        self.payload.issuer.verify_strict(&signed, &self.signature)?;
+        Ok(())
     }
 
     pub fn audience(&self) -> &VerifyingKey {
@@ -528,6 +541,24 @@ mod test {
         assert_eq!(hex::encode(rcan.encode()), expected);
         assert_eq!(Rcan::decode(&rcan.encode())?, rcan);
         Ok(())
+    }
+
+    #[test]
+    fn deserialize_rejects_forged_signature() {
+        let issuer = SigningKey::from_bytes(&[0u8; 32]);
+        let audience = SigningKey::from_bytes(&[1u8; 32]);
+        let rcan = Rcan::issuing_builder(&issuer, audience.verifying_key(), Rpc::ReadWrite)
+            .sign(Expires::Never);
+
+        // A genuine token round-trips through serde.
+        let mut wire = postcard::to_stdvec(&rcan).unwrap();
+        assert_eq!(postcard::from_bytes::<Rcan<Rpc>>(&wire).unwrap(), rcan);
+
+        // The trailing bytes are the signature. Zeroing them must make
+        // deserialization fail rather than yield an unverified token.
+        let n = wire.len();
+        wire[n - SIGNATURE_LENGTH..].fill(0);
+        assert!(postcard::from_bytes::<Rcan<Rpc>>(&wire).is_err());
     }
 
     #[test]
