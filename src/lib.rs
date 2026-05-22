@@ -391,7 +391,9 @@ impl<C> Rcan<C> {
         C: Serialize,
     {
         let signed = postcard::to_extend(&self.payload, DST.to_vec())?;
-        self.payload.issuer.verify_strict(&signed, &self.signature)?;
+        self.payload
+            .issuer
+            .verify_strict(&signed, &self.signature)?;
         Ok(())
     }
 
