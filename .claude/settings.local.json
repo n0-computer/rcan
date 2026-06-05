@@ -6,7 +6,8 @@
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:postcard.jamesmunns.com)"
+      "WebFetch(domain:postcard.jamesmunns.com)",
+      "mcp__acp__Write"
     ]
   }
 }

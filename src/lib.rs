@@ -18,24 +18,55 @@ pub const DST: &[u8] = b"rcan-1-delegation";
 /// Capabilities can be compared using [`Capability::permits`], which determines
 /// whether one capability grants permission to perform another.
 ///
-/// A common implementation of this trait might be an enum representing different
-/// RPC request types.
+/// The default implementation uses equality, which is correct for flat capability
+/// sets. Override `permits` for hierarchical capabilities where broader variants
+/// should permit narrower ones.
 ///
-/// The `Capability` type must be serializable so it can be included in the signature
-/// payload in an [`Rcan`].
-pub trait Capability: Serialize {
+/// # Examples
+///
+/// A flat capability needs no custom `permits`:
+///
+/// ```ignore
+/// #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+/// enum EchoCap { Echo }
+/// impl Capability for EchoCap {} // permits defaults to equality
+/// ```
+///
+/// A hierarchical capability overrides `permits`:
+///
+/// ```ignore
+/// impl Capability for Rpc {
+///     fn permits(&self, other: &Self) -> bool {
+///         matches!((self, other),
+///             (Rpc::All, _) |
+///             (Rpc::ReadWrite, Rpc::ReadWrite | Rpc::Read) |
+///             (Rpc::Read, Rpc::Read)
+///         )
+///     }
+/// }
+/// ```
+pub trait Capability: Serialize + PartialEq {
     /// Determines if `self` permits `other`.
     ///
     /// Returns `true` if `self` grants permission to perform the `other` capability,
     /// otherwise returns `false`.
-    fn permits(&self, other: &Self) -> bool;
+    ///
+    /// The default implementation checks equality.
+    fn permits(&self, other: &Self) -> bool {
+        self == other
+    }
 }
 
 /// Extension of [`Capability`] for types that support the full grant verification API.
 ///
 /// Implementors get access to the [`Verifier`] builder on [`Rcan`] for structured,
 /// typed verification of grants.
+///
+/// This trait is automatically implemented for any type that satisfies the bounds,
+/// so you never need to write `impl GrantCapability for MyType {}` manually.
 pub trait GrantCapability: Capability + DeserializeOwned + Clone + fmt::Debug {}
+
+impl<T> GrantCapability for T where T: Capability + DeserializeOwned + Clone + fmt::Debug {}
 
 /// An authorizer for invocations.
 ///
@@ -755,7 +786,41 @@ mod test {
         }
     }
 
-    impl GrantCapability for Rpc {}
+    /// A flat capability that relies on the default `permits` (equality).
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+    enum FlatCap {
+        Echo,
+        Ping,
+    }
+
+    impl Capability for FlatCap {}
+
+    #[test]
+    fn test_flat_capability_default_permits() {
+        assert!(FlatCap::Echo.permits(&FlatCap::Echo));
+        assert!(FlatCap::Ping.permits(&FlatCap::Ping));
+        assert!(!FlatCap::Echo.permits(&FlatCap::Ping));
+        assert!(!FlatCap::Ping.permits(&FlatCap::Echo));
+    }
+
+    #[test]
+    fn test_flat_capability_with_verifier() -> TestResult {
+        let issuer = SigningKey::from_bytes(&[0u8; 32]);
+        let audience = SigningKey::from_bytes(&[1u8; 32]);
+        let rcan = Rcan::issuing_builder(&issuer, audience.verifying_key(), FlatCap::Echo)
+            .sign(Expires::Never);
+
+        let result = rcan.verifier().capability(&FlatCap::Echo).check();
+        assert!(result.is_ok());
+
+        let result = rcan.verifier().capability(&FlatCap::Ping).check();
+        assert!(matches!(
+            *result.unwrap_err(),
+            VerifyError::CapabilityInsufficient
+        ));
+
+        Ok(())
+    }
 
     #[test]
     fn test_simple_capabilitys() {
