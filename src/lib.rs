@@ -6,8 +6,6 @@ use ed25519_dalek::{ed25519::signature::Signer, Signature, SigningKey, Verifying
 use n0_future::time::{Duration, SystemTime};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::serialization::SignatureWire;
-
 mod serialization;
 
 pub const VERSION: u8 = 1;
@@ -121,62 +119,6 @@ pub struct Rcan<C> {
     pub payload: Payload<C>,
     /// Signature over the serialized payload.
     pub signature: Signature,
-}
-
-impl<C: Serialize> Serialize for Rcan<C> {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeTuple;
-        let mut tup = serializer.serialize_tuple(2)?;
-        tup.serialize_element(&self.payload)?;
-        tup.serialize_element(&SignatureWire(self.signature.to_bytes()))?;
-        tup.end()
-    }
-}
-
-impl<'de, C: Deserialize<'de> + Serialize> Deserialize<'de> for Rcan<C> {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct RcanVisitor<C>(std::marker::PhantomData<C>);
-
-        impl<'de, C: Deserialize<'de> + Serialize> serde::de::Visitor<'de> for RcanVisitor<C> {
-            type Value = Rcan<C>;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("an rcan token (payload, signature)")
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let payload: Payload<C> = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let SignatureWire(sig_bytes) = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                let rcan = Rcan {
-                    payload,
-                    signature: Signature::from_bytes(&sig_bytes),
-                };
-
-                // Verify before yielding, so a deserialized `Rcan` is
-                // always signature checked. Without this, serde wire
-                // formats hand back an unverified token while only
-                // `decode` checks the signature.
-                rcan.verify_signature().map_err(serde::de::Error::custom)?;
-
-                Ok(rcan)
-            }
-        }
-
-        deserializer.deserialize_tuple(2, RcanVisitor::<C>(std::marker::PhantomData))
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, derive_more::Debug, PartialEq, Eq)]
