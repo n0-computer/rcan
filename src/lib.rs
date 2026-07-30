@@ -90,7 +90,7 @@ impl Authorizer {
                 hex::encode(self.identity)
             );
 
-            // Verify that the capability doesn't break out of capabilitys:
+            // Verify that the capability is never restricted beyond what's required:
             ensure!(
                 proof.payload.capability().permits(&capability),
                 "invocation failed"
@@ -399,6 +399,29 @@ mod test {
         let n = wire.len();
         wire[n - SIGNATURE_LENGTH..].fill(0);
         assert!(postcard::from_bytes::<Rcan<Rpc>>(&wire).is_err());
+    }
+
+    #[test]
+    fn deserialize_old_format_without_version() -> TestResult {
+        let issuer = SigningKey::from_bytes(&[0u8; 32]);
+        let audience = SigningKey::from_bytes(&[1u8; 32]);
+        let rcan = Rcan::issuing_builder(&issuer, audience.verifying_key(), Rpc::ReadWrite)
+            .sign(Expires::Never);
+
+        // Current format includes the version byte as the first byte.
+        let new_wire = rcan.encode();
+        assert_eq!(new_wire[0], VERSION);
+
+        // Strip the version byte to simulate the old (pre-versioning) format.
+        let old_wire = &new_wire[1..];
+        assert_eq!(old_wire[0], 0x20); // issuer length prefix
+
+        // The old-format bytes should deserialize through the serde impl,
+        // not just through `Rcan::decode`.
+        let decoded: Rcan<Rpc> = postcard::from_bytes(old_wire)?;
+        assert_eq!(decoded, rcan);
+
+        Ok(())
     }
 
     #[test]

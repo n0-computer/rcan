@@ -1,7 +1,7 @@
-use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
+use ed25519_dalek::{Signature, VerifyingKey, SIGNATURE_LENGTH};
 use serde::{Deserialize, Serialize};
 
-use crate::{Payload, Rcan, VERSION};
+use crate::{CapabilityOrigin, Expires, Payload, Rcan, VERSION};
 
 impl<C: Serialize> Serialize for Rcan<C> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -17,6 +17,25 @@ impl<C: Serialize> Serialize for Rcan<C> {
     }
 }
 
+/// First byte of an old-format (pre-versioning) `Rcan` token in postcard:
+/// the varint length prefix (32) for the issuer's `VerifyingKey` byte array.
+const OLD_FORMAT_MARKER: u8 = 0x20;
+
+/// Wrapper to deserialize a [`VerifyingKey`] through `verifying_key_serde`
+/// (length-prefixed bytes in binary, hex in human-readable) when reading
+/// individual fields from a `SeqAccess`.
+struct VerifyingKeyWire(VerifyingKey);
+
+impl<'de> Deserialize<'de> for VerifyingKeyWire {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(VerifyingKeyWire(verifying_key_serde::deserialize(
+            deserializer,
+        )?))
+    }
+}
+
 impl<'de, C: Deserialize<'de> + Serialize> Deserialize<'de> for Rcan<C> {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -28,27 +47,69 @@ impl<'de, C: Deserialize<'de> + Serialize> Deserialize<'de> for Rcan<C> {
             type Value = Rcan<C>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("an rcan token (payload, signature)")
+                f.write_str("an rcan token (version, payload, signature) or legacy (payload, signature)")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                let version: u8 = seq
+                // Read the first byte. In the current format this is the
+                // version number. In the old (pre-versioning) format this is
+                // the postcard varint length prefix (0x20 = 32) for the
+                // issuer's `VerifyingKey` byte array.
+                let first: u8 = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                if version != VERSION {
+
+                let (payload, sig_bytes) = if first == VERSION {
+                    // Current format: (version, payload, signature)
+                    let payload: Payload<C> = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                    let SignatureWire(sig_bytes) = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                    (payload, sig_bytes)
+                } else if first == OLD_FORMAT_MARKER {
+                    // Old format: the 0x20 we consumed was the issuer's
+                    // length prefix. Read the 32 issuer bytes directly
+                    // (no prefix), then the remaining payload fields and
+                    // signature normally.
+                    let issuer_bytes: [u8; 32] = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                    let issuer = VerifyingKey::from_bytes(&issuer_bytes)
+                        .map_err(serde::de::Error::custom)?;
+                    let VerifyingKeyWire(audience) = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                    let capability_origin: CapabilityOrigin = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                    let capability: C = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
+                    let valid_until: Expires = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
+                    let payload = Payload {
+                        issuer,
+                        audience,
+                        capability_origin,
+                        capability,
+                        valid_until,
+                    };
+                    let SignatureWire(sig_bytes) = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(6, &self))?;
+                    (payload, sig_bytes)
+                } else {
                     return Err(serde::de::Error::custom(format!(
-                        "version not supported, got {version}, but only supporting {VERSION}"
+                        "expected version {VERSION} or old-format marker 0x20, got first byte {first:#04x}"
                     )));
-                }
-                let payload: Payload<C> = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                let SignatureWire(sig_bytes) = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                };
+
                 let rcan = Rcan {
                     payload,
                     signature: Signature::from_bytes(&sig_bytes),
@@ -64,7 +125,9 @@ impl<'de, C: Deserialize<'de> + Serialize> Deserialize<'de> for Rcan<C> {
             }
         }
 
-        deserializer.deserialize_tuple(3, RcanVisitor::<C>(std::marker::PhantomData))
+        // Use a tuple size large enough for the old format (7 elements).
+        // The new format only reads 3; postcard's SeqAccess allows fewer.
+        deserializer.deserialize_tuple(7, RcanVisitor::<C>(std::marker::PhantomData))
     }
 }
 
