@@ -1,7 +1,7 @@
 use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
 use serde::{Deserialize, Serialize};
 
-use crate::{Payload, Rcan};
+use crate::{Payload, Rcan, VERSION};
 
 impl<C: Serialize> Serialize for Rcan<C> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -9,7 +9,8 @@ impl<C: Serialize> Serialize for Rcan<C> {
         S: serde::Serializer,
     {
         use serde::ser::SerializeTuple;
-        let mut tup = serializer.serialize_tuple(2)?;
+        let mut tup = serializer.serialize_tuple(3)?;
+        tup.serialize_element(&VERSION)?;
         tup.serialize_element(&self.payload)?;
         tup.serialize_element(&SignatureWire(self.signature.to_bytes()))?;
         tup.end()
@@ -34,12 +35,20 @@ impl<'de, C: Deserialize<'de> + Serialize> Deserialize<'de> for Rcan<C> {
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                let payload: Payload<C> = seq
+                let version: u8 = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let SignatureWire(sig_bytes) = seq
+                if version != VERSION {
+                    return Err(serde::de::Error::custom(format!(
+                        "version not supported, got {version}, but only supporting {VERSION}"
+                    )));
+                }
+                let payload: Payload<C> = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let SignatureWire(sig_bytes) = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
                 let rcan = Rcan {
                     payload,
                     signature: Signature::from_bytes(&sig_bytes),
@@ -55,7 +64,7 @@ impl<'de, C: Deserialize<'de> + Serialize> Deserialize<'de> for Rcan<C> {
             }
         }
 
-        deserializer.deserialize_tuple(2, RcanVisitor::<C>(std::marker::PhantomData))
+        deserializer.deserialize_tuple(3, RcanVisitor::<C>(std::marker::PhantomData))
     }
 }
 
@@ -87,7 +96,7 @@ pub(crate) mod verifying_key_serde {
 /// a fixed-length tuple of `SIGNATURE_LENGTH` bytes (no length prefix in
 /// binary formats like postcard), and as a lowercase hex string in
 /// human-readable formats.
-pub(crate) struct SignatureWire(pub(crate) [u8; SIGNATURE_LENGTH]);
+struct SignatureWire([u8; SIGNATURE_LENGTH]);
 
 impl Serialize for SignatureWire {
     fn serialize<S: serde::Serializer>(

@@ -1,7 +1,7 @@
 use std::ops::Add;
 
 // TODO: better error management
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use ed25519_dalek::{ed25519::signature::Signer, Signature, SigningKey, VerifyingKey};
 use n0_future::time::{Duration, SystemTime};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -208,20 +208,16 @@ impl<C> Rcan<C> {
     where
         C: Serialize,
     {
-        postcard::to_extend(self, vec![VERSION]).expect("vec")
+        postcard::to_extend(self, Vec::new()).expect("vec")
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self>
     where
         C: DeserializeOwned + Serialize,
     {
-        let Some(version) = bytes.first() else {
-            bail!("cannot decode, token is empty");
-        };
-        ensure!(*version == VERSION, "invalid version: {}", version);
         // `Rcan`'s `Deserialize` verifies the signature, so a successful
         // decode is already signature-checked.
-        let rcan: Self = postcard::from_bytes(&bytes[1..]).context("decoding")?;
+        let rcan: Self = postcard::from_bytes(&bytes).context("decoding")?;
         Ok(rcan)
     }
 
