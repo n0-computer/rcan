@@ -121,8 +121,8 @@ fn oracle_rpc_matrix() {
             let audience = key(100 + j as u8).verifying_key();
             let owner = key(200).verifying_key();
 
-            let issued = rcan_v1::Rcan::issuing_builder(&issuer, audience, *cap)
-                .sign(expires.clone());
+            let issued =
+                rcan_v1::Rcan::issuing_builder(&issuer, audience, *cap).sign(expires.clone());
             check_against_oracle(&issued);
 
             let delegated = rcan_v1::Rcan::delegating_builder(&issuer, audience, owner, *cap)
@@ -150,13 +150,9 @@ fn oracle_variable_length_capabilities() {
             .sign(rcan_v1::Expires::At(1_800_000_000));
         check_against_oracle(&issued);
 
-        let delegated = rcan_v1::Rcan::delegating_builder(
-            &issuer,
-            audience,
-            key(60).verifying_key(),
-            cap,
-        )
-        .sign(rcan_v1::Expires::Never);
+        let delegated =
+            rcan_v1::Rcan::delegating_builder(&issuer, audience, key(60).verifying_key(), cap)
+                .sign(rcan_v1::Expires::Never);
         check_against_oracle(&delegated);
     }
 }

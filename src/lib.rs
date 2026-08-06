@@ -344,11 +344,12 @@ enum DelegationWire {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delegation(DelegationWire);
 
-pub struct DelegationBuilder<'s> {
+pub struct DelegationBuilder<'s, C> {
     issuer: &'s SigningKey,
     audience: VerifyingKey,
     capability_origin: CapabilityOrigin,
     capability: Vec<u8>,
+    capability_type: std::marker::PhantomData<C>,
 }
 
 impl Delegation {
@@ -356,12 +357,13 @@ impl Delegation {
         issuer: &'s SigningKey,
         audience: VerifyingKey,
         capability: &C,
-    ) -> DelegationBuilder<'s> {
+    ) -> DelegationBuilder<'s, C> {
         DelegationBuilder {
             issuer,
             audience,
             capability_origin: CapabilityOrigin::Issuer,
             capability: postcard::to_stdvec(capability).expect("vec"),
+            capability_type: std::marker::PhantomData,
         }
     }
 
@@ -370,12 +372,13 @@ impl Delegation {
         audience: VerifyingKey,
         owner: VerifyingKey,
         capability: &C,
-    ) -> DelegationBuilder<'s> {
+    ) -> DelegationBuilder<'s, C> {
         DelegationBuilder {
             issuer,
             audience,
             capability_origin: CapabilityOrigin::Delegation(owner),
             capability: postcard::to_stdvec(capability).expect("vec"),
+            capability_type: std::marker::PhantomData,
         }
     }
 
@@ -493,8 +496,12 @@ impl Delegation {
     }
 }
 
-impl DelegationBuilder<'_> {
-    pub fn sign(self, valid_until: Expires) -> Delegation {
+impl<C> DelegationBuilder<'_, C> {
+    /// Sign, producing a [`TypedDelegation`]: the builder was given the
+    /// capability as a `C`, so the vocabulary invariant holds by
+    /// construction. Use [`TypedDelegation::into_delegation`] (or
+    /// `.into()`) where the untyped form is wanted.
+    pub fn sign(self, valid_until: Expires) -> TypedDelegation<C> {
         let payload = Payload {
             issuer: self.issuer.verifying_key(),
             audience: self.audience,
@@ -504,7 +511,126 @@ impl DelegationBuilder<'_> {
         };
         let to_sign = postcard::to_extend(&payload, DST.to_vec()).expect("vec");
         let signature = self.issuer.sign(&to_sign);
-        Delegation(DelegationWire::V2(Signed { payload, signature }))
+        TypedDelegation {
+            delegation: Delegation(DelegationWire::V2(Signed { payload, signature })),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A [`Delegation`] with a vocabulary: the capability bytes are
+/// guaranteed to parse as a canonical `C` encoding.
+///
+/// This adds type safety at the edges — most usefully in message
+/// schemas: a field of this type states the protocol's vocabulary, and
+/// deserialization validates it, so a foreign vocabulary token is a
+/// malformed message at the protocol boundary instead of a deny inside
+/// the authorizer. The serde and wire forms are identical to
+/// [`Delegation`]'s.
+///
+/// Produced by the builders (where the invariant holds by construction)
+/// or by fallible conversion from a [`Delegation`]; convert back with
+/// [`Self::into_delegation`] or `From`. Deliberately no `Deref`: this
+/// is a refinement, not a smart pointer.
+pub struct TypedDelegation<C> {
+    delegation: Delegation,
+    _marker: std::marker::PhantomData<C>,
+}
+
+impl<C> AsRef<Delegation> for TypedDelegation<C> {
+    fn as_ref(&self) -> &Delegation {
+        self.delegation()
+    }
+}
+
+impl<C> TypedDelegation<C> {
+    pub fn delegation(&self) -> &Delegation {
+        &self.delegation
+    }
+
+    pub fn into_delegation(self) -> Delegation {
+        self.delegation
+    }
+}
+
+impl<C: DeserializeOwned> TypedDelegation<C> {
+    /// The capability. Infallible: the type's invariant guarantees the
+    /// bytes parse.
+    pub fn capability(&self) -> C {
+        postcard::from_bytes(self.delegation.capability())
+            .expect("invariant: capability parses as C")
+    }
+}
+
+/// Fails if the capability bytes are not a canonical `C` encoding.
+impl<C: DeserializeOwned> TryFrom<Delegation> for TypedDelegation<C> {
+    type Error = anyhow::Error;
+
+    fn try_from(delegation: Delegation) -> Result<Self> {
+        match postcard::take_from_bytes::<C>(delegation.capability()) {
+            Ok((_, [])) => Ok(Self {
+                delegation,
+                _marker: std::marker::PhantomData,
+            }),
+            _ => bail!("capability does not parse in the vocabulary"),
+        }
+    }
+}
+
+/// Reflexive, so that `&Delegation` satisfies `AsRef<Delegation>`
+/// bounds alongside [`TypedDelegation`] (std has no blanket reflexive
+/// `AsRef`).
+impl AsRef<Delegation> for Delegation {
+    fn as_ref(&self) -> &Delegation {
+        self
+    }
+}
+
+impl<C> From<TypedDelegation<C>> for Delegation {
+    fn from(typed: TypedDelegation<C>) -> Self {
+        typed.delegation
+    }
+}
+
+impl<C> std::fmt::Debug for TypedDelegation<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.delegation.fmt(f)
+    }
+}
+
+impl<C> Clone for TypedDelegation<C> {
+    fn clone(&self) -> Self {
+        Self {
+            delegation: self.delegation.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<C> PartialEq for TypedDelegation<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.delegation == other.delegation
+    }
+}
+
+impl<C> Eq for TypedDelegation<C> {}
+
+impl<C> Serialize for TypedDelegation<C> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.delegation.serialize(serializer)
+    }
+}
+
+impl<'de, C: DeserializeOwned> Deserialize<'de> for TypedDelegation<C> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        let delegation = Delegation::deserialize(deserializer)?;
+        Self::try_from(delegation).map_err(D::Error::custom)
     }
 }
 
@@ -531,6 +657,20 @@ impl<'de> Deserialize<'de> for Delegation {
             DelegationWire::V2(signed) => signed.verify_v2().map_err(D::Error::custom)?,
         }
         Ok(Self(wire))
+    }
+}
+
+/// The standard capability judgement: the link's capability bytes must
+/// parse as a canonical `C` encoding, consumed exactly, and permit the
+/// invoked capability; anything else is a deny.
+fn capability_predicate<C: Capability, T: AsRef<Delegation>>(
+    capability: C,
+) -> impl Fn(&T) -> bool {
+    move |proof| {
+        match postcard::take_from_bytes::<C>(proof.as_ref().capability()) {
+            Ok((granted, [])) => granted.permits(&capability),
+            _ => false,
+        }
     }
 }
 
@@ -580,11 +720,52 @@ impl Authorizer {
         capability: C,
         proof_chain: &[&Delegation],
     ) -> Result<()> {
+        self.check_invocation_impl(now, invoker, capability_predicate(capability), proof_chain)
+    }
+
+    /// [`Self::check_invocation_from`] for a typed proof chain: the
+    /// chain's vocabulary and the invoked capability are locked to the
+    /// same `C`, so a vocabulary mismatch is unrepresentable. To check a
+    /// typed chain against a different vocabulary, go via the untyped
+    /// form with [`TypedDelegation::delegation`].
+    pub fn check_typed_invocation_from<C: Capability>(
+        &self,
+        invoker: VerifyingKey,
+        capability: C,
+        proof_chain: &[&TypedDelegation<C>],
+    ) -> Result<()> {
+        self.check_typed_invocation_from_at(SystemTime::now(), invoker, capability, proof_chain)
+    }
+
+    /// [`Self::check_typed_invocation_from`] with an explicit clock.
+    pub fn check_typed_invocation_from_at<C: Capability>(
+        &self,
+        now: SystemTime,
+        invoker: VerifyingKey,
+        capability: C,
+        proof_chain: &[&TypedDelegation<C>],
+    ) -> Result<()> {
+        self.check_invocation_impl(now, invoker, capability_predicate(capability), proof_chain)
+    }
+
+    /// The shared chain walk, generic over anything that views as a
+    /// [`Delegation`] and over how a link's capability is judged. The
+    /// capability semantics live entirely in the `permitted` predicate,
+    /// so the walk itself needs no capability type — a caller may pass
+    /// `|_| true` to check only the envelope structure of a chain.
+    fn check_invocation_impl<T: AsRef<Delegation>>(
+        &self,
+        now: SystemTime,
+        invoker: VerifyingKey,
+        permitted: impl Fn(&T) -> bool,
+        proof_chain: &[T],
+    ) -> Result<()> {
         // We require that proof chains are provided "back-to-front".
         // So they start with the owner of the capability, then
         // proceed with the next item in the chain.
         let mut current_issuer_target = &self.identity;
-        for proof in proof_chain {
+        for original in proof_chain {
+            let proof = original.as_ref();
             // Verify proof chain issuer/audience integrity:
             let issuer = proof.issuer();
             ensure!(
@@ -609,11 +790,7 @@ impl Authorizer {
             );
 
             // Verify that the capability doesn't break out of capabilities:
-            let permitted = match postcard::take_from_bytes::<C>(proof.capability()) {
-                Ok((granted, [])) => granted.permits(&capability),
-                _ => false,
-            };
-            ensure!(permitted, "invocation failed");
+            ensure!(permitted(original), "invocation failed");
 
             // Continue checking the proof chain's integrity with this
             // delegation's audience as the next issuer target:
@@ -674,8 +851,10 @@ mod tests {
     fn v2_roundtrip() {
         let issuer = key(0);
         let audience = key(1).verifying_key();
-        let delegation =
-            Delegation::issuing_builder(&issuer, audience, &Rpc::ReadWrite).sign(Expires::Never);
+        let delegation: Delegation =
+            Delegation::issuing_builder(&issuer, audience, &Rpc::ReadWrite)
+                .sign(Expires::Never)
+                .into();
 
         let bytes = delegation.encode();
         assert_eq!(bytes[0], 2);
@@ -703,8 +882,9 @@ mod tests {
     fn v2_decode_rejects_tampering() {
         let issuer = key(0);
         let audience = key(1).verifying_key();
-        let delegation =
-            Delegation::issuing_builder(&issuer, audience, &Rpc::Read).sign(Expires::Never);
+        let delegation: Delegation = Delegation::issuing_builder(&issuer, audience, &Rpc::Read)
+            .sign(Expires::Never)
+            .into();
         let good = delegation.encode();
 
         // Zeroed signature.
@@ -765,16 +945,14 @@ mod tests {
         }
 
         // Envelope accessors, C free.
-        let root =
-            Delegation::decode_any::<Rpc>(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
+        let root = Delegation::decode_any::<Rpc>(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
         assert_eq!(root.issuer(), &service.verifying_key());
         assert_eq!(root.audience(), &alice.verifying_key());
         assert_eq!(root.capability_issuer(), &service.verifying_key());
         assert_eq!(root.expires(), &Expires::At(4_102_444_800));
         assert_eq!(root.capability(), &[2]); // Rpc::All
 
-        let link =
-            Delegation::decode_any::<Rpc>(&hex::decode(V1_LINK_VERSIONED).unwrap()).unwrap();
+        let link = Delegation::decode_any::<Rpc>(&hex::decode(V1_LINK_VERSIONED).unwrap()).unwrap();
         assert_eq!(link.issuer(), &alice.verifying_key());
         assert_eq!(link.audience(), &bob.verifying_key());
         assert_eq!(link.capability_issuer(), &service.verifying_key());
@@ -828,17 +1006,17 @@ mod tests {
 
         // The root grant is a legacy v1 token (pinned vector: service
         // grants alice everything)...
-        let root =
-            Delegation::decode_any::<Rpc>(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
+        let root = Delegation::decode_any::<Rpc>(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
 
         // ...and alice delegates onward with v2.
-        let link = Delegation::delegating_builder(
+        let link: Delegation = Delegation::delegating_builder(
             &alice,
             bob.verifying_key(),
             service.verifying_key(),
             &Rpc::Read,
         )
-        .sign(Expires::Never);
+        .sign(Expires::Never)
+        .into();
 
         let authorizer = Authorizer::new(service.verifying_key());
         let chain = [&root, &link];
@@ -848,23 +1026,17 @@ mod tests {
         authorizer
             .check_invocation_from_at(now, bob.verifying_key(), Rpc::Read, &chain)
             .unwrap();
-        assert!(
-            authorizer
-                .check_invocation_from_at(now, bob.verifying_key(), Rpc::ReadWrite, &chain)
-                .is_err()
-        );
-        assert!(
-            authorizer
-                .check_invocation_from_at(now, key(3).verifying_key(), Rpc::Read, &chain)
-                .is_err()
-        );
+        assert!(authorizer
+            .check_invocation_from_at(now, bob.verifying_key(), Rpc::ReadWrite, &chain)
+            .is_err());
+        assert!(authorizer
+            .check_invocation_from_at(now, key(3).verifying_key(), Rpc::Read, &chain)
+            .is_err());
         // After the root grant's expiry, the chain is dead.
         let late = SystemTime::UNIX_EPOCH + Duration::from_secs(4_102_444_801);
-        assert!(
-            authorizer
-                .check_invocation_from_at(late, bob.verifying_key(), Rpc::Read, &chain)
-                .is_err()
-        );
+        assert!(authorizer
+            .check_invocation_from_at(late, bob.verifying_key(), Rpc::Read, &chain)
+            .is_err());
     }
 
     #[test]
@@ -873,14 +1045,14 @@ mod tests {
         let alice = key(1);
         let bob = key(2);
 
-        let alice_grant = Delegation::issuing_builder(&alice, bob.verifying_key(), &Rpc::All)
-            .sign(Expires::Never);
+        let alice_grant: Delegation =
+            Delegation::issuing_builder(&alice, bob.verifying_key(), &Rpc::All)
+                .sign(Expires::Never)
+                .into();
         let authorizer = Authorizer::new(service.verifying_key());
-        assert!(
-            authorizer
-                .check_invocation_from(bob.verifying_key(), Rpc::Read, &[&alice_grant])
-                .is_err()
-        );
+        assert!(authorizer
+            .check_invocation_from(bob.verifying_key(), Rpc::Read, &[&alice_grant])
+            .is_err());
     }
 
     #[test]
@@ -891,19 +1063,85 @@ mod tests {
 
         // The service passes on authority rooted at some *other* key; a
         // chain of it proves nothing about the service's own resources.
-        let delegation = Delegation::delegating_builder(
+        let delegation: Delegation = Delegation::delegating_builder(
             &service,
             alice.verifying_key(),
             other.verifying_key(),
             &Rpc::All,
         )
-        .sign(Expires::Never);
+        .sign(Expires::Never)
+        .into();
         let authorizer = Authorizer::new(service.verifying_key());
+        assert!(authorizer
+            .check_invocation_from(alice.verifying_key(), Rpc::Read, &[&delegation])
+            .is_err());
+    }
+
+    #[test]
+    fn typed_delegation() {
+        let issuer = key(0);
+        let audience = key(1).verifying_key();
+
+        // The builder produces a typed delegation; the capability is
+        // recoverable without a Result.
+        let typed =
+            Delegation::issuing_builder(&issuer, audience, &Rpc::ReadWrite).sign(Expires::Never);
+        assert_eq!(typed.capability(), Rpc::ReadWrite);
+
+        // Downcast and checked upcast round trip.
+        let untyped: Delegation = typed.clone().into();
+        let again = TypedDelegation::<Rpc>::try_from(untyped.clone()).unwrap();
+        assert_eq!(again, typed);
+
+        // The upcast is checked: a foreign vocabulary is rejected.
+        #[derive(Debug, Serialize, Deserialize)]
+        struct OtherVocabulary {
+            topic: String,
+            write: bool,
+        }
+        assert!(TypedDelegation::<OtherVocabulary>::try_from(untyped.clone()).is_err());
+
+        // The serde form is identical to the untyped one...
+        let wire = postcard::to_stdvec(&typed).unwrap();
+        assert_eq!(wire, postcard::to_stdvec(&untyped).unwrap());
+
+        // ...but deserialization validates the vocabulary: a schema
+        // field of the right type accepts, of a foreign type rejects at
+        // message decode time.
+        let ok: TypedDelegation<Rpc> = postcard::from_bytes(&wire).unwrap();
+        assert_eq!(ok, typed);
+        assert!(postcard::from_bytes::<TypedDelegation<OtherVocabulary>>(&wire).is_err());
+
+        // A typed chain checks against the same vocabulary, with the
+        // chain and invoked capability locked together.
+        let bob = key(2);
+        let typed_link = Delegation::delegating_builder(
+            &key(1),
+            bob.verifying_key(),
+            issuer.verifying_key(),
+            &Rpc::Read,
+        )
+        .sign(Expires::Never);
+        let root = Delegation::issuing_builder(&issuer, audience, &Rpc::All).sign(Expires::Never);
+        let authorizer = Authorizer::new(issuer.verifying_key());
+        authorizer
+            .check_typed_invocation_from(bob.verifying_key(), Rpc::Read, &[&root, &typed_link])
+            .unwrap();
         assert!(
             authorizer
-                .check_invocation_from(alice.verifying_key(), Rpc::Read, &[&delegation])
+                .check_typed_invocation_from(
+                    bob.verifying_key(),
+                    Rpc::ReadWrite,
+                    &[&root, &typed_link]
+                )
                 .is_err()
         );
+
+        // A typed v1 token works the same way: type safety is
+        // orthogonal to version.
+        let v1 = Delegation::decode_any::<Rpc>(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
+        let typed_v1 = TypedDelegation::<Rpc>::try_from(v1).unwrap();
+        assert_eq!(typed_v1.capability(), Rpc::All);
     }
 
     #[test]
@@ -913,10 +1151,8 @@ mod tests {
         authorizer
             .check_invocation_from(service.verifying_key(), Rpc::All, &[])
             .unwrap();
-        assert!(
-            authorizer
-                .check_invocation_from(key(1).verifying_key(), Rpc::Read, &[])
-                .is_err()
-        );
+        assert!(authorizer
+            .check_invocation_from(key(1).verifying_key(), Rpc::Read, &[])
+            .is_err());
     }
 }

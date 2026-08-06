@@ -23,7 +23,7 @@ use anyhow::{bail, ensure, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{CapabilityOrigin, Delegation, Expires, Payload, Signed, SignatureWire};
+use crate::{CapabilityOrigin, Delegation, Expires, Payload, SignatureWire, Signed};
 
 /// The v1 domain separation tag.
 pub(crate) const DST: &[u8] = b"rcan-1-delegation";
@@ -73,8 +73,7 @@ pub(crate) fn v1_verify(signed: &Signed) -> Result<()> {
 /// exact consumption. The capability type is needed to find the end of
 /// the capability field.
 pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<Signed> {
-    let (wire, leftover) =
-        postcard::take_from_bytes::<V1Wire<C>>(bytes).context("decoding v1")?;
+    let (wire, leftover) = postcard::take_from_bytes::<V1Wire<C>>(bytes).context("decoding v1")?;
     ensure!(
         leftover.is_empty(),
         "cannot decode v1, {} trailing bytes",
@@ -162,8 +161,9 @@ mod prefixed_key_serde {
                 }
 
                 fn visit_bytes<E: Error>(self, v: &[u8]) -> std::result::Result<Self::Value, E> {
-                    let bytes: [u8; 32] =
-                        v.try_into().map_err(|_| E::invalid_length(v.len(), &self))?;
+                    let bytes: [u8; 32] = v
+                        .try_into()
+                        .map_err(|_| E::invalid_length(v.len(), &self))?;
                     VerifyingKey::from_bytes(&bytes).map_err(E::custom)
                 }
             }
@@ -338,8 +338,10 @@ mod tests {
     #[test]
     fn v1_compat_construction_is_checked() {
         // A v2 token cannot be represented in v1 compatible form.
-        let v2_token = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
-            .sign(Expires::Never);
+        let v2_token: Delegation =
+            Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
+                .sign(Expires::Never)
+                .into();
         assert!(V1Compat::<Rpc>::try_from(v2_token).is_err());
 
         // Nor can a v1 token whose capability bytes are a different
