@@ -15,8 +15,6 @@
 
 mod v1;
 
-pub use v1::V1Compat;
-
 // TODO: better error management (n0-error?)
 use anyhow::{bail, ensure, Context, Result};
 use ed25519_dalek::{
@@ -24,6 +22,7 @@ use ed25519_dalek::{
 };
 use n0_future::time::{Duration, SystemTime};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+pub use v1::V1Compat;
 
 /// Domain separation tag for v2 signatures.
 pub const DST: &[u8] = b"rcan-2-delegation";
@@ -663,14 +662,10 @@ impl<'de> Deserialize<'de> for Delegation {
 /// The standard capability judgement: the link's capability bytes must
 /// parse as a canonical `C` encoding, consumed exactly, and permit the
 /// invoked capability; anything else is a deny.
-fn capability_predicate<C: Capability, T: AsRef<Delegation>>(
-    capability: C,
-) -> impl Fn(&T) -> bool {
-    move |proof| {
-        match postcard::take_from_bytes::<C>(proof.as_ref().capability()) {
-            Ok((granted, [])) => granted.permits(&capability),
-            _ => false,
-        }
+fn capability_predicate<C: Capability, T: AsRef<Delegation>>(capability: C) -> impl Fn(&T) -> bool {
+    move |proof| match postcard::take_from_bytes::<C>(proof.as_ref().capability()) {
+        Ok((granted, [])) => granted.permits(&capability),
+        _ => false,
     }
 }
 
@@ -1127,15 +1122,9 @@ mod tests {
         authorizer
             .check_typed_invocation_from(bob.verifying_key(), Rpc::Read, &[&root, &typed_link])
             .unwrap();
-        assert!(
-            authorizer
-                .check_typed_invocation_from(
-                    bob.verifying_key(),
-                    Rpc::ReadWrite,
-                    &[&root, &typed_link]
-                )
-                .is_err()
-        );
+        assert!(authorizer
+            .check_typed_invocation_from(bob.verifying_key(), Rpc::ReadWrite, &[&root, &typed_link])
+            .is_err());
 
         // A typed v1 token works the same way: type safety is
         // orthogonal to version.
