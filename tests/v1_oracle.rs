@@ -6,7 +6,7 @@
 //! it byte for byte in every direction.
 
 use ed25519_dalek::SigningKey;
-use rcan::{Delegation, Expires, TypedDelegation, V1Compat};
+use rcan::{Delegation, Expires};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,12 +36,8 @@ fn check_against_oracle<C: Serialize + serde::de::DeserializeOwned>(rcan: &rcan_
     let versioned = rcan.encode();
 
     // Both wire forms decode to equal values.
-    let delegation = TypedDelegation::<C>::decode(&versioned)
-        .unwrap()
-        .into_delegation();
-    let from_naked = TypedDelegation::<C>::decode(&naked)
-        .unwrap()
-        .into_delegation();
+    let delegation = Delegation::<C>::decode(&versioned).unwrap().into_opaque();
+    let from_naked = Delegation::<C>::decode(&naked).unwrap().into_opaque();
     assert_eq!(delegation, from_naked);
 
     // encode reproduces the versioned form exactly.
@@ -64,49 +60,9 @@ fn check_against_oracle<C: Serialize + serde::de::DeserializeOwned>(rcan: &rcan_
         postcard::to_stdvec(rcan.capability()).unwrap()
     );
 
-    // V1Compat serializes byte identically to the oracle's naked serde.
-    let compat = V1Compat::<C>::try_from(delegation.clone()).unwrap();
-    assert_eq!(postcard::to_stdvec(&compat).unwrap(), naked);
-
-    // V1Compat reads what the oracle writes.
-    let read: V1Compat<C> = postcard::from_bytes(&naked).unwrap();
-    assert_eq!(read.delegation(), &delegation);
-
-    // And the oracle reads what V1Compat writes (trivially, same bytes;
-    // this closes the loop through the real deserializer).
-    let back: rcan_v1::Rcan<C> = postcard::from_bytes(&naked).unwrap();
-    assert_eq!(back.encode(), versioned);
-
-    // The human readable dialect matches too: identical JSON in both
-    // directions.
-    let oracle_json = serde_json::to_string(rcan).unwrap();
-    assert_eq!(serde_json::to_string(&compat).unwrap(), oracle_json);
-    let read: V1Compat<C> = serde_json::from_str(&oracle_json).unwrap();
-    assert_eq!(read.delegation(), &delegation);
-    let back: rcan_v1::Rcan<C> =
-        serde_json::from_str(&serde_json::to_string(&compat).unwrap()).unwrap();
-    assert_eq!(back.encode(), versioned);
-
-    // CBOR: a binary format that, unlike postcard, is self describing —
-    // identical bytes in both directions.
-    let mut oracle_cbor = Vec::new();
-    ciborium::into_writer(rcan, &mut oracle_cbor).unwrap();
-    let mut compat_cbor = Vec::new();
-    ciborium::into_writer(&compat, &mut compat_cbor).unwrap();
-    assert_eq!(compat_cbor, oracle_cbor);
-    let read: V1Compat<C> = ciborium::from_reader(&oracle_cbor[..]).unwrap();
-    assert_eq!(read.delegation(), &delegation);
-    let back: rcan_v1::Rcan<C> = ciborium::from_reader(&compat_cbor[..]).unwrap();
-    assert_eq!(back.encode(), versioned);
-
-    // RON: a human readable format that preserves more structure than
-    // JSON — identical strings in both directions.
-    let oracle_ron = ron::to_string(rcan).unwrap();
-    assert_eq!(ron::to_string(&compat).unwrap(), oracle_ron);
-    let read: V1Compat<C> = ron::from_str(&oracle_ron).unwrap();
-    assert_eq!(read.delegation(), &delegation);
-    let back: rcan_v1::Rcan<C> = ron::from_str(&ron::to_string(&compat).unwrap()).unwrap();
-    assert_eq!(back.encode(), versioned);
+    // The unverified decode agrees with the verified one on valid input.
+    let unverified = Delegation::<C>::decode_v1_unverified(&versioned).unwrap();
+    assert_eq!(unverified.opaque(), &delegation);
 }
 
 #[test]
@@ -158,34 +114,5 @@ fn oracle_variable_length_capabilities() {
             rcan_v1::Rcan::delegating_builder(&issuer, audience, key(60).verifying_key(), cap)
                 .sign(rcan_v1::Expires::Never);
         check_against_oracle(&delegated);
-    }
-}
-
-/// [`V1Compat::issue`] mints byte-for-byte what the real v1 crate mints
-/// with the same inputs, and the oracle verifies it.
-#[test]
-fn oracle_accepts_freshly_minted_v1() {
-    let expiries = [
-        (rcan_v1::Expires::Never, Expires::Never),
-        (rcan_v1::Expires::At(1_800_000_000), Expires::At(1_800_000_000)),
-    ];
-    for (i, (oracle_expires, expires)) in expiries.iter().enumerate() {
-        let issuer = key(30 + i as u8);
-        let audience = key(70).verifying_key();
-        let cap = Scoped {
-            topic: "fresh/mint".to_string(),
-            write: true,
-            limit: Some(42),
-        };
-
-        let oracle = rcan_v1::Rcan::issuing_builder(&issuer, audience, cap.clone())
-            .sign(oracle_expires.clone());
-        let minted = V1Compat::<Scoped>::issue(&issuer, audience, &cap, expires.clone());
-
-        // Identical naked serde bytes, and the oracle reads ours back.
-        let naked = postcard::to_stdvec(&minted).unwrap();
-        assert_eq!(naked, postcard::to_stdvec(&oracle).unwrap());
-        let back: rcan_v1::Rcan<Scoped> = postcard::from_bytes(&naked).unwrap();
-        assert_eq!(back.encode(), minted.delegation().encode());
     }
 }

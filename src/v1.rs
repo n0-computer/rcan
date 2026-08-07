@@ -19,11 +19,11 @@
 //! A naked v1 token is `payload ++ 64 signature bytes`; the versioned
 //! form prefixes `0x01`. The signature covers `DST ++ payload`.
 
-use anyhow::{bail, ensure, Context, Result};
-use ed25519_dalek::{ed25519::signature::Signer, Signature, SigningKey, VerifyingKey};
+use anyhow::{ensure, Context, Result};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{CapabilityOrigin, Delegation, Expires, Payload, SignatureWire, Signed, TypedDelegation};
+use crate::{CapabilityOrigin, Expires, Payload, SignatureWire, Signed};
 
 /// The v1 domain separation tag.
 pub(crate) const DST: &[u8] = b"rcan-1-delegation";
@@ -82,131 +82,16 @@ pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<
     wire.into_signed()
 }
 
-/// A wrapper around [`Delegation`] whose postcard serialization is byte
-/// identical to a naked v1 `Rcan` of rcan 0.4.x, for use in message
-/// schemas that must stay wire compatible with v1 peers.
-///
-/// The invariant, enforced at construction: the wrapped token is a v1
-/// token whose capability bytes parse in the vocabulary `C`. A v2 token
-/// has no v1 signature and cannot be represented; foreign vocabulary
-/// bytes would produce a well formed v1 token the receiving `C` typed
-/// peer rejects.
-///
-/// Wire compatibility covers both of v1's serde dialects: postcard
-/// (byte identical) and human readable formats like JSON (hex keys and
-/// signature, matching serdect's output). Other binary formats are
-/// unspecified.
-pub struct V1Compat<C>(Delegation, std::marker::PhantomData<C>);
-
-/// Fails if the token is not v1, or if its capability bytes are not a
-/// canonical `C` encoding.
-impl<C: DeserializeOwned> TryFrom<Delegation> for V1Compat<C> {
-    type Error = anyhow::Error;
-
-    fn try_from(delegation: Delegation) -> Result<Self> {
-        ensure!(
-            delegation.is_v1(),
-            "only a v1 token can be serialized in v1 compatible form"
-        );
-        match postcard::take_from_bytes::<C>(delegation.capability()) {
-            Ok((_, [])) => Ok(Self(delegation, std::marker::PhantomData)),
-            _ => bail!("capability does not parse in the wrapper's vocabulary"),
-        }
-    }
-}
-
-impl<C> V1Compat<C> {
-    pub fn delegation(&self) -> &Delegation {
-        &self.0
-    }
-
-    pub fn into_inner(self) -> Delegation {
-        self.0
-    }
-}
-
-impl<C: DeserializeOwned> V1Compat<C> {
-    /// The capability. Infallible: construction guarantees the bytes
-    /// parse, exactly as for [`TypedDelegation`](TypedDelegation).
-    pub fn capability(&self) -> C {
-        postcard::from_bytes(self.0.capability()).expect("invariant: capability parses as C")
-    }
-}
-
-impl<C: Serialize + DeserializeOwned> V1Compat<C> {
-    /// Mint a fresh v1 token: issuer-origin, in the vocabulary `C`.
-    ///
-    /// For surfaces whose readers speak only the v1 wire format (rcan
-    /// 0.4.x). Everything else mints v2 via the builders on
-    /// [`Delegation`].
-    pub fn issue(
-        issuer: &SigningKey,
-        audience: VerifyingKey,
-        capability: &C,
-        valid_until: Expires,
-    ) -> Self {
-        let payload = Payload {
-            issuer: issuer.verifying_key(),
-            audience,
-            capability_origin: CapabilityOrigin::Issuer,
-            valid_until,
-            capability: postcard::to_stdvec(capability).expect("vec"),
-        };
-        let mut to_sign = DST.to_vec();
-        to_sign.extend_from_slice(&v1_payload_bytes(&payload));
-        let signature = issuer.sign(&to_sign);
-        Self(
-            Delegation::from_v1(Signed { payload, signature }),
-            std::marker::PhantomData,
-        )
-    }
-}
-
-// Manual impls so `C` needs no bounds; the phantom carries no data.
-impl<C> std::fmt::Debug for V1Compat<C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("V1Compat").field(&self.0).finish()
-    }
-}
-
-impl<C> Clone for V1Compat<C> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone(), std::marker::PhantomData)
-    }
-}
-
-impl<C> PartialEq for V1Compat<C> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl<C> Eq for V1Compat<C> {}
-
-/// A v1-compat token is vocabulary-checked by construction, so the
-/// typed view is a free conversion.
-impl<C> From<V1Compat<C>> for TypedDelegation<C> {
-    fn from(value: V1Compat<C>) -> Self {
-        TypedDelegation {
-            delegation: value.0,
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-/// Fails if the token is not v1; the vocabulary is already guaranteed
-/// by the typed wrapper.
-impl<C> TryFrom<TypedDelegation<C>> for V1Compat<C> {
-    type Error = anyhow::Error;
-
-    fn try_from(value: TypedDelegation<C>) -> Result<Self> {
-        let delegation = value.into_delegation();
-        ensure!(
-            delegation.is_v1(),
-            "only a v1 token can be serialized in v1 compatible form"
-        );
-        Ok(Self(delegation, std::marker::PhantomData))
-    }
+/// [`v1_parse`] without the signature check, for tokens whose signature
+/// an already-verifying path has checked.
+pub(crate) fn v1_parse_unverified<C: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<Signed> {
+    let (wire, leftover) = postcard::take_from_bytes::<V1Wire<C>>(bytes).context("decoding v1")?;
+    ensure!(
+        leftover.is_empty(),
+        "cannot decode v1, {} trailing bytes",
+        leftover.len()
+    );
+    wire.into_signed_unverified()
 }
 
 /// Serde for a [`VerifyingKey`] in the v1 encoding: length prefixed
@@ -261,11 +146,7 @@ mod prefixed_key_serde {
 /// replaced by the wire compatible [`prefixed_key_serde`]. A tuple
 /// struct because v1's `Rcan` serialized as a 2-tuple (in JSON: an
 /// array of payload and signature).
-///
-/// [`V1Compat`] serializes by converting the inner delegation into this
-/// struct (parsing the opaque capability bytes as `C`), and
-/// deserializes by converting back. Postcard's deterministic encoding
-/// makes the round trip through the typed capability byte exact.
+
 struct V1Wire<C>(V1Payload<C>, Signature);
 
 /// Manual impls so the serde calls match v1's `Rcan` exactly: a plain
@@ -313,31 +194,9 @@ enum V1CapabilityOrigin {
 }
 
 impl<C: Serialize + DeserializeOwned> V1Wire<C> {
-    fn from_signed(signed: &Signed) -> Result<Self> {
-        let (capability, leftover) = postcard::take_from_bytes::<C>(&signed.payload.capability)
-            .context("capability does not parse in the wrapper's vocabulary")?;
-        ensure!(
-            leftover.is_empty(),
-            "capability does not parse in the wrapper's vocabulary"
-        );
-        Ok(Self(
-            V1Payload {
-                issuer: signed.payload.issuer,
-                audience: signed.payload.audience,
-                capability_origin: match &signed.payload.capability_origin {
-                    CapabilityOrigin::Issuer => V1CapabilityOrigin::Issuer,
-                    CapabilityOrigin::Delegation(key) => V1CapabilityOrigin::Delegation(*key),
-                },
-                capability,
-                valid_until: signed.payload.valid_until.clone(),
-            },
-            signed.signature,
-        ))
-    }
-
-    fn into_signed(self) -> Result<Signed> {
+    fn into_signed_unverified(self) -> Result<Signed> {
         let Self(payload, signature) = self;
-        let signed = Signed {
+        Ok(Signed {
             payload: Payload {
                 issuer: payload.issuer,
                 audience: payload.audience,
@@ -349,7 +208,11 @@ impl<C: Serialize + DeserializeOwned> V1Wire<C> {
                 capability: postcard::to_stdvec(&payload.capability)?,
             },
             signature,
-        };
+        })
+    }
+
+    fn into_signed(self) -> Result<Signed> {
+        let signed = self.into_signed_unverified()?;
         // Verify before yielding, so a deserialized token is always
         // signature checked.
         v1_verify(&signed)?;
@@ -357,92 +220,31 @@ impl<C: Serialize + DeserializeOwned> V1Wire<C> {
     }
 }
 
-impl<C: Serialize + DeserializeOwned> Serialize for V1Compat<C> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        let wire = V1Wire::<C>::from_signed(self.0.signed()).map_err(serde::ser::Error::custom)?;
-        wire.serialize(serializer)
-    }
-}
-
-impl<'de, C: Serialize + DeserializeOwned> Deserialize<'de> for V1Compat<C> {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        use serde::de::Error;
-        let wire = V1Wire::<C>::deserialize(deserializer)?;
-        let signed = wire.into_signed().map_err(D::Error::custom)?;
-        Ok(Self(Delegation::from_v1(signed), std::marker::PhantomData))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tests::{key, Rpc, V1_LINK_NAKED, V1_LINK_VERSIONED, V1_ROOT_NAKED};
+    use crate::tests::{Rpc, V1_ROOT_NAKED, V1_ROOT_VERSIONED};
+    use crate::Delegation;
 
+    /// The unverified decode parses both v1 wire forms to the same value
+    /// as the verifying decode.
     #[test]
-    fn v1_compat_is_byte_identical_to_naked_v1() {
-        for naked_hex in [V1_ROOT_NAKED, V1_LINK_NAKED] {
-            let naked = hex::decode(naked_hex).unwrap();
-            let delegation = TypedDelegation::<Rpc>::decode(&naked)
-                .unwrap()
-                .into_delegation();
+    fn unverified_decode_matches_verified() {
+        let versioned = hex::decode(V1_ROOT_VERSIONED).unwrap();
+        let naked = hex::decode(V1_ROOT_NAKED).unwrap();
 
-            // Serializing through the wrapper is byte identical to what
-            // an old codebase produces with naked v1 serde.
-            let compat = V1Compat::<Rpc>::try_from(delegation.clone()).unwrap();
-            assert_eq!(postcard::to_stdvec(&compat).unwrap(), naked);
-
-            // And the wrapper reads what an old codebase sends.
-            let read: V1Compat<Rpc> = postcard::from_bytes(&naked).unwrap();
-            assert_eq!(read.delegation(), &delegation);
+        let verified = Delegation::<Rpc>::decode(&versioned).unwrap();
+        for bytes in [&versioned, &naked] {
+            let unverified = Delegation::<Rpc>::decode_v1_unverified(bytes).unwrap();
+            assert_eq!(unverified, verified);
         }
 
-        // Old style and new style message schemas are wire compatible in
-        // both directions: something after the token survives.
-        let naked = hex::decode(V1_LINK_NAKED).unwrap();
-        let delegation = TypedDelegation::<Rpc>::decode(&naked)
-            .unwrap()
-            .into_delegation();
-        let compat = V1Compat::<Rpc>::try_from(delegation.clone()).unwrap();
-        let message = postcard::to_stdvec(&(&compat, "hello")).unwrap();
-        let mut expected = naked.clone();
-        expected.extend_from_slice(&postcard::to_stdvec(&"hello").unwrap());
-        assert_eq!(message, expected);
-        let (read, note): (V1Compat<Rpc>, String) = postcard::from_bytes(&message).unwrap();
-        assert_eq!(read.delegation(), &delegation);
-        assert_eq!(note, "hello");
-
-        // A tampered token is rejected on deserialization.
-        let mut tampered = hex::decode(V1_ROOT_NAKED).unwrap();
-        let capability_offset = 33 + 33 + 1;
-        tampered[capability_offset] = 0;
-        assert!(postcard::from_bytes::<V1Compat<Rpc>>(&tampered).is_err());
-    }
-
-    #[test]
-    fn v1_compat_construction_is_checked() {
-        // A v2 token cannot be represented in v1 compatible form.
-        let v2_token: Delegation =
-            Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
-                .sign(Expires::Never)
-                .into();
-        assert!(V1Compat::<Rpc>::try_from(v2_token).is_err());
-
-        // Nor can a v1 token whose capability bytes are a different
-        // vocabulary.
-        #[derive(Debug, Serialize, Deserialize)]
-        struct OtherVocabulary {
-            topic: String,
-            write: bool,
-        }
-        let versioned = hex::decode(V1_LINK_VERSIONED).unwrap();
-        let foreign = TypedDelegation::<Rpc>::decode(&versioned)
-            .unwrap()
-            .into_delegation();
-        assert!(V1Compat::<OtherVocabulary>::try_from(foreign).is_err());
+        // The signature is genuinely not checked: a tampered token
+        // parses. This is the contract; callers convert values whose
+        // signature an already-verifying path has checked.
+        let mut tampered = versioned.clone();
+        let n = tampered.len();
+        tampered[n - 1] ^= 1;
+        assert!(Delegation::<Rpc>::decode(&tampered).is_err());
+        assert!(Delegation::<Rpc>::decode_v1_unverified(&tampered).is_ok());
     }
 }

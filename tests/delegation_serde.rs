@@ -1,10 +1,10 @@
-//! Snapshot tests for the serde forms of [`Delegation`] (the top level
+//! Snapshot tests for the serde forms of [`OpaqueDelegation`] (the top level
 //! framing), for a v1 and a v2 token: bytes for postcard and CBOR, text
 //! for JSON and RON. These pin the framing the way the pinned vectors
 //! pin the v1 wire format.
 
 use ed25519_dalek::SigningKey;
-use rcan::{Delegation, Expires, TypedDelegation};
+use rcan::{Delegation, Expires, OpaqueDelegation};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,16 +20,16 @@ fn key(seed: u8) -> SigningKey {
 
 /// A deterministic v1 token: service ([0; 32]) grants alice ([1; 32])
 /// everything until 4_102_444_800.
-fn v1_token() -> Delegation {
+fn v1_token() -> OpaqueDelegation {
     let rcan = rcan_v1::Rcan::issuing_builder(&key(0), key(1).verifying_key(), Rpc::All)
         .sign(rcan_v1::Expires::At(4_102_444_800));
-    TypedDelegation::<Rpc>::decode(&rcan.encode())
+    Delegation::<Rpc>::decode(&rcan.encode())
         .unwrap()
-        .into_delegation()
+        .into_opaque()
 }
 
 /// A deterministic v2 token: same keys, ReadWrite, same expiry.
-fn v2_token() -> Delegation {
+fn v2_token() -> OpaqueDelegation {
     Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::ReadWrite)
         .sign(Expires::At(4_102_444_800))
         .into()
@@ -52,7 +52,7 @@ fn postcard_snapshots() {
     for (token, pinned) in [(v1_token(), V1_POSTCARD), (v2_token(), V2_POSTCARD)] {
         let bytes = postcard::to_stdvec(&token).unwrap();
         assert_eq!(hex::encode(&bytes), pinned);
-        let back: Delegation = postcard::from_bytes(&bytes).unwrap();
+        let back: OpaqueDelegation = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, token);
     }
     // For v2 the serde form equals the wire form; for v1 it does not
@@ -67,7 +67,7 @@ fn cbor_snapshots() {
         let mut bytes = Vec::new();
         ciborium::into_writer(&token, &mut bytes).unwrap();
         assert_eq!(hex::encode(&bytes), pinned);
-        let back: Delegation = ciborium::from_reader(&bytes[..]).unwrap();
+        let back: OpaqueDelegation = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(back, token);
     }
 }
@@ -76,7 +76,7 @@ fn cbor_snapshots() {
 fn json_snapshots() {
     for (token, pinned) in [(v1_token(), V1_JSON), (v2_token(), V2_JSON)] {
         assert_eq!(serde_json::to_string(&token).unwrap(), pinned);
-        let back: Delegation = serde_json::from_str(pinned).unwrap();
+        let back: OpaqueDelegation = serde_json::from_str(pinned).unwrap();
         assert_eq!(back, token);
     }
 }
@@ -85,7 +85,7 @@ fn json_snapshots() {
 fn ron_snapshots() {
     for (token, pinned) in [(v1_token(), V1_RON), (v2_token(), V2_RON)] {
         assert_eq!(ron::to_string(&token).unwrap(), pinned);
-        let back: Delegation = ron::from_str(pinned).unwrap();
+        let back: OpaqueDelegation = ron::from_str(pinned).unwrap();
         assert_eq!(back, token);
     }
 }
