@@ -82,18 +82,6 @@ pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<
     wire.into_signed()
 }
 
-/// [`v1_parse`] without the signature check, for tokens whose signature
-/// an already-verifying path has checked.
-pub(crate) fn v1_parse_unverified<C: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<Signed> {
-    let (wire, leftover) = postcard::take_from_bytes::<V1Wire<C>>(bytes).context("decoding v1")?;
-    ensure!(
-        leftover.is_empty(),
-        "cannot decode v1, {} trailing bytes",
-        leftover.len()
-    );
-    wire.into_signed_unverified()
-}
-
 /// Serde for a [`VerifyingKey`] in the v1 encoding: length prefixed
 /// bytes in binary formats (what serdect produced), lowercase hex in
 /// human-readable ones.
@@ -194,9 +182,9 @@ enum V1CapabilityOrigin {
 }
 
 impl<C: Serialize + DeserializeOwned> V1Wire<C> {
-    fn into_signed_unverified(self) -> Result<Signed> {
+    fn into_signed(self) -> Result<Signed> {
         let Self(payload, signature) = self;
-        Ok(Signed {
+        let signed = Signed {
             payload: Payload {
                 issuer: payload.issuer,
                 audience: payload.audience,
@@ -208,43 +196,10 @@ impl<C: Serialize + DeserializeOwned> V1Wire<C> {
                 capability: postcard::to_stdvec(&payload.capability)?,
             },
             signature,
-        })
-    }
-
-    fn into_signed(self) -> Result<Signed> {
-        let signed = self.into_signed_unverified()?;
+        };
         // Verify before yielding, so a deserialized token is always
         // signature checked.
         v1_verify(&signed)?;
         Ok(signed)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::tests::{Rpc, V1_ROOT_NAKED, V1_ROOT_VERSIONED};
-    use crate::Delegation;
-
-    /// The unverified decode parses both v1 wire forms to the same value
-    /// as the verifying decode.
-    #[test]
-    fn unverified_decode_matches_verified() {
-        let versioned = hex::decode(V1_ROOT_VERSIONED).unwrap();
-        let naked = hex::decode(V1_ROOT_NAKED).unwrap();
-
-        let verified = Delegation::<Rpc>::decode(&versioned).unwrap();
-        for bytes in [&versioned, &naked] {
-            let unverified = Delegation::<Rpc>::decode_v1_unverified(bytes).unwrap();
-            assert_eq!(unverified, verified);
-        }
-
-        // The signature is genuinely not checked: a tampered token
-        // parses. This is the contract; callers convert values whose
-        // signature an already-verifying path has checked.
-        let mut tampered = versioned.clone();
-        let n = tampered.len();
-        tampered[n - 1] ^= 1;
-        assert!(Delegation::<Rpc>::decode(&tampered).is_err());
-        assert!(Delegation::<Rpc>::decode_v1_unverified(&tampered).is_ok());
     }
 }

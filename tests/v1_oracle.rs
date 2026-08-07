@@ -59,10 +59,6 @@ fn check_against_oracle<C: Serialize + serde::de::DeserializeOwned>(rcan: &rcan_
         delegation.capability(),
         postcard::to_stdvec(rcan.capability()).unwrap()
     );
-
-    // The unverified decode agrees with the verified one on valid input.
-    let unverified = Delegation::<C>::decode_v1_unverified(&versioned).unwrap();
-    assert_eq!(unverified.opaque(), &delegation);
 }
 
 #[test]

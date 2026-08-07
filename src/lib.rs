@@ -583,25 +583,6 @@ impl<C: DeserializeOwned> Delegation<C> {
 }
 
 impl<C: Serialize + DeserializeOwned> Delegation<C> {
-    /// Decode a *v1* token without verifying its signature.
-    ///
-    /// For converting values whose signature an already-verifying path
-    /// has checked — e.g. an in-memory rcan 0.4.x `Rcan`, all of whose
-    /// construction paths verify. Never feed this bytes off the wire;
-    /// use [`Self::decode`] there.
-    pub fn decode_v1_unverified(bytes: &[u8]) -> Result<Self> {
-        let signed = match bytes.first() {
-            None => bail!("cannot decode, token is empty"),
-            Some(0x01) => v1::v1_parse_unverified::<C>(&bytes[1..])?,
-            Some(0x20) => v1::v1_parse_unverified::<C>(bytes)?,
-            _ => bail!("not a v1 token"),
-        };
-        Ok(Delegation {
-            opaque: OpaqueDelegation(DelegationWire::V1(signed)),
-            _marker: std::marker::PhantomData,
-        })
-    }
-
     /// Decode a token of any supported version in the vocabulary `C`.
     ///
     /// The capability bytes are validated as a canonical `C` encoding
@@ -792,7 +773,7 @@ impl Authorizer {
     /// chain's vocabulary and the invoked capability are locked to the
     /// same `C`, so a vocabulary mismatch is unrepresentable. To check a
     /// typed chain against a different vocabulary, go via the untyped
-    /// form with [`Delegation::delegation`].
+    /// form with [`Delegation::opaque`].
     pub fn check_invocation_from<C: Capability>(
         &self,
         invoker: VerifyingKey,
