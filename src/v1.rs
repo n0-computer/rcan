@@ -20,10 +20,10 @@
 //! form prefixes `0x01`. The signature covers `DST ++ payload`.
 
 use anyhow::{bail, ensure, Context, Result};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{ed25519::signature::Signer, Signature, SigningKey, VerifyingKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{CapabilityOrigin, Delegation, Expires, Payload, SignatureWire, Signed};
+use crate::{CapabilityOrigin, Delegation, Expires, Payload, SignatureWire, Signed, TypedDelegation};
 
 /// The v1 domain separation tag.
 pub(crate) const DST: &[u8] = b"rcan-1-delegation";
@@ -122,6 +122,90 @@ impl<C> V1Compat<C> {
 
     pub fn into_inner(self) -> Delegation {
         self.0
+    }
+}
+
+impl<C: DeserializeOwned> V1Compat<C> {
+    /// The capability. Infallible: construction guarantees the bytes
+    /// parse, exactly as for [`TypedDelegation`](TypedDelegation).
+    pub fn capability(&self) -> C {
+        postcard::from_bytes(self.0.capability()).expect("invariant: capability parses as C")
+    }
+}
+
+impl<C: Serialize + DeserializeOwned> V1Compat<C> {
+    /// Mint a fresh v1 token: issuer-origin, in the vocabulary `C`.
+    ///
+    /// For surfaces whose readers speak only the v1 wire format (rcan
+    /// 0.4.x). Everything else mints v2 via the builders on
+    /// [`Delegation`].
+    pub fn issue(
+        issuer: &SigningKey,
+        audience: VerifyingKey,
+        capability: &C,
+        valid_until: Expires,
+    ) -> Self {
+        let payload = Payload {
+            issuer: issuer.verifying_key(),
+            audience,
+            capability_origin: CapabilityOrigin::Issuer,
+            valid_until,
+            capability: postcard::to_stdvec(capability).expect("vec"),
+        };
+        let mut to_sign = DST.to_vec();
+        to_sign.extend_from_slice(&v1_payload_bytes(&payload));
+        let signature = issuer.sign(&to_sign);
+        Self(
+            Delegation::from_v1(Signed { payload, signature }),
+            std::marker::PhantomData,
+        )
+    }
+}
+
+// Manual impls so `C` needs no bounds; the phantom carries no data.
+impl<C> std::fmt::Debug for V1Compat<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("V1Compat").field(&self.0).finish()
+    }
+}
+
+impl<C> Clone for V1Compat<C> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), std::marker::PhantomData)
+    }
+}
+
+impl<C> PartialEq for V1Compat<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<C> Eq for V1Compat<C> {}
+
+/// A v1-compat token is vocabulary-checked by construction, so the
+/// typed view is a free conversion.
+impl<C> From<V1Compat<C>> for TypedDelegation<C> {
+    fn from(value: V1Compat<C>) -> Self {
+        TypedDelegation {
+            delegation: value.0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Fails if the token is not v1; the vocabulary is already guaranteed
+/// by the typed wrapper.
+impl<C> TryFrom<TypedDelegation<C>> for V1Compat<C> {
+    type Error = anyhow::Error;
+
+    fn try_from(value: TypedDelegation<C>) -> Result<Self> {
+        let delegation = value.into_delegation();
+        ensure!(
+            delegation.is_v1(),
+            "only a v1 token can be serialized in v1 compatible form"
+        );
+        Ok(Self(delegation, std::marker::PhantomData))
     }
 }
 
@@ -303,7 +387,9 @@ mod tests {
     fn v1_compat_is_byte_identical_to_naked_v1() {
         for naked_hex in [V1_ROOT_NAKED, V1_LINK_NAKED] {
             let naked = hex::decode(naked_hex).unwrap();
-            let delegation = Delegation::decode_any::<Rpc>(&naked).unwrap();
+            let delegation = TypedDelegation::<Rpc>::decode(&naked)
+                .unwrap()
+                .into_delegation();
 
             // Serializing through the wrapper is byte identical to what
             // an old codebase produces with naked v1 serde.
@@ -318,7 +404,9 @@ mod tests {
         // Old style and new style message schemas are wire compatible in
         // both directions: something after the token survives.
         let naked = hex::decode(V1_LINK_NAKED).unwrap();
-        let delegation = Delegation::decode_any::<Rpc>(&naked).unwrap();
+        let delegation = TypedDelegation::<Rpc>::decode(&naked)
+            .unwrap()
+            .into_delegation();
         let compat = V1Compat::<Rpc>::try_from(delegation.clone()).unwrap();
         let message = postcard::to_stdvec(&(&compat, "hello")).unwrap();
         let mut expected = naked.clone();
@@ -352,7 +440,9 @@ mod tests {
             write: bool,
         }
         let versioned = hex::decode(V1_LINK_VERSIONED).unwrap();
-        let foreign = Delegation::decode_any::<Rpc>(&versioned).unwrap();
+        let foreign = TypedDelegation::<Rpc>::decode(&versioned)
+            .unwrap()
+            .into_delegation();
         assert!(V1Compat::<OtherVocabulary>::try_from(foreign).is_err());
     }
 }

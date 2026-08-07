@@ -6,7 +6,7 @@
 //! it byte for byte in every direction.
 
 use ed25519_dalek::SigningKey;
-use rcan::{Delegation, Expires, V1Compat};
+use rcan::{Delegation, Expires, TypedDelegation, V1Compat};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,8 +36,12 @@ fn check_against_oracle<C: Serialize + serde::de::DeserializeOwned>(rcan: &rcan_
     let versioned = rcan.encode();
 
     // Both wire forms decode to equal values.
-    let delegation = Delegation::decode_any::<C>(&versioned).unwrap();
-    let from_naked = Delegation::decode_any::<C>(&naked).unwrap();
+    let delegation = TypedDelegation::<C>::decode(&versioned)
+        .unwrap()
+        .into_delegation();
+    let from_naked = TypedDelegation::<C>::decode(&naked)
+        .unwrap()
+        .into_delegation();
     assert_eq!(delegation, from_naked);
 
     // encode reproduces the versioned form exactly.
@@ -154,5 +158,34 @@ fn oracle_variable_length_capabilities() {
             rcan_v1::Rcan::delegating_builder(&issuer, audience, key(60).verifying_key(), cap)
                 .sign(rcan_v1::Expires::Never);
         check_against_oracle(&delegated);
+    }
+}
+
+/// [`V1Compat::issue`] mints byte-for-byte what the real v1 crate mints
+/// with the same inputs, and the oracle verifies it.
+#[test]
+fn oracle_accepts_freshly_minted_v1() {
+    let expiries = [
+        (rcan_v1::Expires::Never, Expires::Never),
+        (rcan_v1::Expires::At(1_800_000_000), Expires::At(1_800_000_000)),
+    ];
+    for (i, (oracle_expires, expires)) in expiries.iter().enumerate() {
+        let issuer = key(30 + i as u8);
+        let audience = key(70).verifying_key();
+        let cap = Scoped {
+            topic: "fresh/mint".to_string(),
+            write: true,
+            limit: Some(42),
+        };
+
+        let oracle = rcan_v1::Rcan::issuing_builder(&issuer, audience, cap.clone())
+            .sign(oracle_expires.clone());
+        let minted = V1Compat::<Scoped>::issue(&issuer, audience, &cap, expires.clone());
+
+        // Identical naked serde bytes, and the oracle reads ours back.
+        let naked = postcard::to_stdvec(&minted).unwrap();
+        assert_eq!(naked, postcard::to_stdvec(&oracle).unwrap());
+        let back: rcan_v1::Rcan<Scoped> = postcard::from_bytes(&naked).unwrap();
+        assert_eq!(back.encode(), minted.delegation().encode());
     }
 }

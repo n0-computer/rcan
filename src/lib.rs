@@ -9,7 +9,7 @@
 //! The wire format is versioned coarsely by a leading version byte,
 //! which doubles as the discriminator of the internal version enum.
 //! The current version is 2. Version 1 (the `Rcan<C>` of rcan 0.4.x)
-//! can be read via [`Delegation::decode_any`] and represented losslessly;
+//! can be read via [`TypedDelegation::decode`] and represented losslessly;
 //! writing the naked v1 serde form for frozen message schemas is done
 //! via [`V1Compat`].
 
@@ -307,7 +307,7 @@ enum Never {}
 ///
 /// Note that the `V1` variant's serde form is the top level framing
 /// (v2 style field encodings), not a v1 wire form — v1 wire bytes can
-/// only be read via [`Delegation::decode_any`], with a capability type.
+/// only be read via [`TypedDelegation::decode`], with a capability type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // transient and short-lived; boxing buys nothing
 #[allow(clippy::large_enum_variant)]
@@ -328,12 +328,12 @@ enum DelegationWire {
 /// All envelope fields are accessible without a capability type, for
 /// every version, so verification ([`Authorizer`]) and transport code
 /// can be version agnostic. The capability type is needed in exactly two
-/// places: decoding v1 wire bytes ([`Self::decode_any`]) and evaluating
+/// places: decoding v1 wire bytes ([`TypedDelegation::decode`]) and evaluating
 /// capabilities during invocation checks.
 ///
 /// There are two byte representations:
 ///
-/// - [`Self::encode`] / [`Self::decode`] / [`Self::decode_any`]: the
+/// - [`Self::encode`] / [`Self::decode`] / [`TypedDelegation::decode`]: the
 ///   versioned wire form; for v1 tokens the `Rcan::encode` form of rcan
 ///   0.4.x, reconstructed. The naked v1 serde form is produced by
 ///   [`V1Compat`] instead.
@@ -385,12 +385,15 @@ impl Delegation {
     /// checked, and the input must be consumed exactly.
     ///
     /// v1 tokens are rejected: deserializing them requires the
-    /// capability type, use [`Self::decode_any`].
+    /// capability type, use [`TypedDelegation::decode`].
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         match bytes.first() {
             None => bail!("cannot decode, token is empty"),
             Some(0x01) | Some(0x20) => {
-                bail!("cannot decode a v1 token without its capability type, use decode_any")
+                bail!(
+                    "cannot decode a v1 token without its capability type, \
+                     use TypedDelegation::decode"
+                )
             }
             _ => {
                 let (wire, leftover) =
@@ -414,23 +417,6 @@ impl Delegation {
                 }
             }
         }
-    }
-
-    /// Decode a token of any supported version, using the capability
-    /// type `C` where needed (v1 only).
-    ///
-    /// Version detection: v1 versioned tokens start with `0x01`, naked
-    /// v1 serde bytes always start with `0x20` (the length prefix of
-    /// the issuer key), and v2 wire tokens start with `0x02`. Version
-    /// 32 must never be assigned, it would collide with naked v1.
-    pub fn decode_any<C: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<Self> {
-        let signed = match bytes.first() {
-            None => bail!("cannot decode, token is empty"),
-            Some(0x01) => v1::v1_parse::<C>(&bytes[1..])?,
-            Some(0x20) => v1::v1_parse::<C>(bytes)?,
-            _ => return Self::decode(bytes),
-        };
-        Ok(Self(DelegationWire::V1(signed)))
     }
 
     /// Encode in the versioned wire form. For v1 tokens this is the
@@ -550,6 +536,48 @@ impl<C> TypedDelegation<C> {
     pub fn into_delegation(self) -> Delegation {
         self.delegation
     }
+
+    // The envelope accessors of [`Delegation`], duplicated so typical
+    // code never has to go through `delegation()`. Deliberately no
+    // `Deref` -- this is a refinement, not a smart pointer.
+
+    pub fn payload(&self) -> &Payload {
+        self.delegation.payload()
+    }
+
+    pub fn signature(&self) -> &Signature {
+        self.delegation.signature()
+    }
+
+    pub fn issuer(&self) -> &VerifyingKey {
+        self.delegation.issuer()
+    }
+
+    pub fn audience(&self) -> &VerifyingKey {
+        self.delegation.audience()
+    }
+
+    pub fn capability_origin(&self) -> &CapabilityOrigin {
+        self.delegation.capability_origin()
+    }
+
+    pub fn capability_issuer(&self) -> &VerifyingKey {
+        self.delegation.capability_issuer()
+    }
+
+    pub fn expires(&self) -> &Expires {
+        self.delegation.expires()
+    }
+
+    /// Encode in the versioned wire form. See [`Delegation::encode`].
+    pub fn encode(&self) -> Vec<u8> {
+        self.delegation.encode()
+    }
+
+    /// Whether this is a v1 token.
+    pub fn is_v1(&self) -> bool {
+        self.delegation.is_v1()
+    }
 }
 
 impl<C: DeserializeOwned> TypedDelegation<C> {
@@ -558,6 +586,34 @@ impl<C: DeserializeOwned> TypedDelegation<C> {
     pub fn capability(&self) -> C {
         postcard::from_bytes(self.delegation.capability())
             .expect("invariant: capability parses as C")
+    }
+}
+
+impl<C: Serialize + DeserializeOwned> TypedDelegation<C> {
+    /// Decode a token of any supported version in the vocabulary `C`.
+    ///
+    /// The capability bytes are validated as a canonical `C` encoding
+    /// for every version (v1 needs `C` to parse at all; for v2 the
+    /// check is the conversion from [`Delegation`]). Use
+    /// [`into_delegation`](Self::into_delegation) where the untyped
+    /// form is wanted; [`Delegation::decode`] decodes v2 tokens without
+    /// a vocabulary.
+    ///
+    /// Version detection: v1 versioned tokens start with `0x01`, naked
+    /// v1 serde bytes always start with `0x20` (the length prefix of
+    /// the issuer key), and v2 wire tokens start with `0x02`. Version
+    /// 32 must never be assigned, it would collide with naked v1.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let signed = match bytes.first() {
+            None => bail!("cannot decode, token is empty"),
+            Some(0x01) => v1::v1_parse::<C>(&bytes[1..])?,
+            Some(0x20) => v1::v1_parse::<C>(bytes)?,
+            _ => return Delegation::decode(bytes)?.try_into(),
+        };
+        Ok(TypedDelegation {
+            delegation: Delegation(DelegationWire::V1(signed)),
+            _marker: std::marker::PhantomData,
+        })
     }
 }
 
@@ -855,9 +911,9 @@ mod tests {
         assert_eq!(bytes[0], 2);
         let decoded = Delegation::decode(&bytes).unwrap();
         assert_eq!(decoded, delegation);
-        // decode_any handles v2 too, C unused.
-        let decoded = Delegation::decode_any::<Rpc>(&bytes).unwrap();
-        assert_eq!(decoded, delegation);
+        // The typed decode handles v2 too, additionally validating the vocabulary.
+        let decoded = TypedDelegation::<Rpc>::decode(&bytes).unwrap();
+        assert_eq!(decoded.into_delegation(), delegation);
 
         assert_eq!(delegation.issuer(), &issuer.verifying_key());
         assert_eq!(delegation.audience(), &audience);
@@ -913,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_decode_any_matches_pinned_vectors() {
+    fn v1_decode_matches_pinned_vectors() {
         let service = key(0);
         let alice = key(1);
         let bob = key(2);
@@ -926,8 +982,12 @@ mod tests {
             let naked = hex::decode(naked_hex).unwrap();
 
             // Both wire forms decode, to equal values.
-            let delegation = Delegation::decode_any::<Rpc>(&versioned).unwrap();
-            let from_naked = Delegation::decode_any::<Rpc>(&naked).unwrap();
+            let delegation = TypedDelegation::<Rpc>::decode(&versioned)
+                .unwrap()
+                .into_delegation();
+            let from_naked = TypedDelegation::<Rpc>::decode(&naked)
+                .unwrap()
+                .into_delegation();
             assert_eq!(delegation, from_naked);
             assert!(delegation.is_v1());
 
@@ -940,14 +1000,18 @@ mod tests {
         }
 
         // Envelope accessors, C free.
-        let root = Delegation::decode_any::<Rpc>(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
+        let root = TypedDelegation::<Rpc>::decode(&hex::decode(V1_ROOT_VERSIONED).unwrap())
+            .unwrap()
+            .into_delegation();
         assert_eq!(root.issuer(), &service.verifying_key());
         assert_eq!(root.audience(), &alice.verifying_key());
         assert_eq!(root.capability_issuer(), &service.verifying_key());
         assert_eq!(root.expires(), &Expires::At(4_102_444_800));
         assert_eq!(root.capability(), &[2]); // Rpc::All
 
-        let link = Delegation::decode_any::<Rpc>(&hex::decode(V1_LINK_VERSIONED).unwrap()).unwrap();
+        let link = TypedDelegation::<Rpc>::decode(&hex::decode(V1_LINK_VERSIONED).unwrap())
+            .unwrap()
+            .into_delegation();
         assert_eq!(link.issuer(), &alice.verifying_key());
         assert_eq!(link.audience(), &bob.verifying_key());
         assert_eq!(link.capability_issuer(), &service.verifying_key());
@@ -960,13 +1024,15 @@ mod tests {
         let capability_offset = 1 + 33 + 33 + 1;
         assert_eq!(tampered[capability_offset], 2);
         tampered[capability_offset] = 0;
-        assert!(Delegation::decode_any::<Rpc>(&tampered).is_err());
+        assert!(TypedDelegation::<Rpc>::decode(&tampered).is_err());
     }
 
     #[test]
     fn v1_serde_roundtrip_in_top_level_framing() {
         let naked = hex::decode(V1_ROOT_NAKED).unwrap();
-        let delegation = Delegation::decode_any::<Rpc>(&naked).unwrap();
+        let delegation = TypedDelegation::<Rpc>::decode(&naked)
+            .unwrap()
+            .into_delegation();
 
         // The serde form is the top level framing: version discriminator
         // 1, then the v2 style struct. Not readable as v1 wire bytes,
@@ -1001,7 +1067,9 @@ mod tests {
 
         // The root grant is a legacy v1 token (pinned vector: service
         // grants alice everything)...
-        let root = Delegation::decode_any::<Rpc>(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
+        let root = TypedDelegation::<Rpc>::decode(&hex::decode(V1_ROOT_VERSIONED).unwrap())
+            .unwrap()
+            .into_delegation();
 
         // ...and alice delegates onward with v2.
         let link: Delegation = Delegation::delegating_builder(
@@ -1128,8 +1196,8 @@ mod tests {
 
         // A typed v1 token works the same way: type safety is
         // orthogonal to version.
-        let v1 = Delegation::decode_any::<Rpc>(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
-        let typed_v1 = TypedDelegation::<Rpc>::try_from(v1).unwrap();
+        let typed_v1 =
+            TypedDelegation::<Rpc>::decode(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
         assert_eq!(typed_v1.capability(), Rpc::All);
     }
 

@@ -4,7 +4,7 @@
 //! pin the v1 wire format.
 
 use ed25519_dalek::SigningKey;
-use rcan::{Delegation, Expires};
+use rcan::{Delegation, Expires, TypedDelegation};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,7 +23,9 @@ fn key(seed: u8) -> SigningKey {
 fn v1_token() -> Delegation {
     let rcan = rcan_v1::Rcan::issuing_builder(&key(0), key(1).verifying_key(), Rpc::All)
         .sign(rcan_v1::Expires::At(4_102_444_800));
-    Delegation::decode_any::<Rpc>(&rcan.encode()).unwrap()
+    TypedDelegation::<Rpc>::decode(&rcan.encode())
+        .unwrap()
+        .into_delegation()
 }
 
 /// A deterministic v2 token: same keys, ReadWrite, same expiry.
