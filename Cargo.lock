@@ -519,6 +519,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "n0-error"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c37e81176a83a77d2514528b91bdafc70ef88aab428f0e1b91aebb8d99888895"
+dependencies = [
+ "n0-error-macros",
+ "spez",
+]
+
+[[package]]
+name = "n0-error-macros"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2acd8b070213b0299282f884b4beba4e7b52d624fdcd504a3ad3665390c11e1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "n0-future"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -636,12 +657,12 @@ dependencies = [
 name = "rcan"
 version = "0.5.0"
 dependencies = [
- "anyhow",
  "ciborium",
  "data-encoding",
  "derive_more",
  "ed25519-dalek",
  "hex",
+ "n0-error",
  "n0-future",
  "postcard",
  "rcan 0.4.0",
@@ -814,6 +835,17 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "spez"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c87e960f4dca2788eeb86bbdde8dd246be8948790b7618d656e68f9b720a86e8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "spin"

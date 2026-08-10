@@ -14,11 +14,10 @@
 
 mod v1;
 
-// TODO: better error management (n0-error?)
-use anyhow::{bail, ensure, Context, Result};
 use ed25519_dalek::{
     ed25519::signature::Signer, Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH,
 };
+use n0_error::{e, stack_error};
 use n0_future::time::{Duration, SystemTime};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -212,6 +211,92 @@ impl Expires {
     }
 }
 
+/// Decoding a delegation failed.
+#[stack_error(derive, add_meta)]
+#[non_exhaustive]
+pub enum DecodeError {
+    /// The bytes are not a well formed token.
+    #[error("malformed token: {reason}")]
+    Malformed {
+        /// What went wrong.
+        reason: String,
+    },
+    /// v1 wire bytes cannot be decoded without their capability type.
+    ///
+    /// Use [`Delegation::decode`], which has one.
+    #[error("cannot decode a v1 token without its capability type, use Delegation::decode")]
+    V1NeedsCapability,
+    /// Signature verification failed.
+    #[error("signature verification failed")]
+    InvalidSignature,
+    /// The capability bytes are not a canonical encoding in the
+    /// vocabulary.
+    #[error("capability does not parse in the vocabulary")]
+    ForeignVocabulary,
+}
+
+impl DecodeError {
+    /// The catch-all for decode failures that carry no structure worth
+    /// matching on.
+    fn malformed(reason: impl std::fmt::Display) -> Self {
+        e!(DecodeError::Malformed {
+            reason: reason.to_string()
+        })
+    }
+}
+
+/// Verifying an invocation against a proof chain failed.
+#[stack_error(derive, add_meta)]
+#[non_exhaustive]
+pub enum InvocationError {
+    /// A proof was not issued by the expected key.
+    ///
+    /// Chains run back-to-front: the first proof must be issued by the
+    /// authorizer, each further one by the previous proof's audience.
+    #[error(
+        "expected proof to be issued by {}, but was issued by {}",
+        hex::encode(expected),
+        hex::encode(found)
+    )]
+    ChainBroken {
+        /// The key that should have issued this proof.
+        expected: VerifyingKey,
+        /// The key that issued it.
+        found: VerifyingKey,
+    },
+    /// A proof's validity window has passed.
+    #[error("proof expired at {expiry}")]
+    Expired {
+        /// When the proof expired.
+        expiry: Expires,
+    },
+    /// A proof passes on authority that is not rooted at the authorizer.
+    #[error(
+        "proof is missing delegation for capability of {}",
+        hex::encode(authorizer)
+    )]
+    WrongCapabilityIssuer {
+        /// The authorizer's key.
+        authorizer: VerifyingKey,
+    },
+    /// A proof's capability does not parse in the vocabulary or does not
+    /// permit the invoked capability.
+    #[error("capability not permitted")]
+    NotPermitted,
+    /// The chain does not end at the invoker.
+    #[error(
+        "expected delegation chain to end in the connection's owner {}, but the connection is authenticated by {} instead",
+        hex::encode(invoker),
+        hex::encode(chain_end)
+    )]
+    WrongInvoker {
+        /// The key that invoked the capability.
+        invoker: VerifyingKey,
+        /// The key the chain actually ends at.
+        chain_end: VerifyingKey,
+    },
+}
+
 /// The signed content of a delegation.
 ///
 /// One struct serves every version: v1 and v2 tokens differ only in
@@ -284,10 +369,11 @@ impl Signed {
     }
 
     /// Verify as a v2 token.
-    fn verify_v2(&self) -> Result<()> {
+    fn verify_v2(&self) -> Result<(), DecodeError> {
         self.payload
             .issuer
-            .verify_strict(&self.signed_bytes_v2(), &self.signature)?;
+            .verify_strict(&self.signed_bytes_v2(), &self.signature)
+            .map_err(|_| e!(DecodeError::InvalidSignature))?;
         Ok(())
     }
 }
@@ -388,36 +474,32 @@ impl OpaqueDelegation {
     ///
     /// v1 tokens are rejected: deserializing them requires the
     /// capability type, use [`Delegation::decode`].
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         match bytes.first() {
-            None => bail!("cannot decode, token is empty"),
-            Some(0x01) | Some(0x20) => {
-                bail!(
-                    "cannot decode a v1 token without its capability type, \
-                     use Delegation::decode"
-                )
-            }
+            None => Err(DecodeError::malformed("token is empty")),
+            Some(0x01) | Some(0x20) => Err(e!(DecodeError::V1NeedsCapability)),
             _ => {
-                let (wire, leftover) =
-                    postcard::take_from_bytes::<DelegationWire>(bytes).context("decoding")?;
-                ensure!(
-                    leftover.is_empty(),
-                    "cannot decode, {} trailing bytes",
-                    leftover.len()
-                );
-                match wire {
-                    DelegationWire::V2(signed) => {
-                        signed.verify_v2()?;
-                        Ok(Self(DelegationWire::V2(signed)))
-                    }
-                    // unreachable: 0x01 leading bytes were rejected
-                    // above, so the V1 variant cannot have been parsed
-                    DelegationWire::V1(_) => bail!("expected a v2 token, found v1"),
-                    // this can never happen, but rustc requires us to
-                    // handle the uninhabited variant
-                    DelegationWire::V0(never) => match never {},
+                let (wire, leftover) = postcard::take_from_bytes::<DelegationWire>(bytes)
+                    .map_err(DecodeError::malformed)?;
+                if !leftover.is_empty() {
+                    return Err(DecodeError::malformed(format_args!(
+                        "{} trailing bytes",
+                        leftover.len()
+                    )));
                 }
+                let out = Self(wire);
+                out.verify()?;
+                Ok(out)
             }
+        }
+    }
+
+    /// Verify the signature, whichever version this is.
+    fn verify(&self) -> Result<(), DecodeError> {
+        match &self.0 {
+            DelegationWire::V0(never) => match *never {},
+            DelegationWire::V1(signed) => v1::v1_verify(signed),
+            DelegationWire::V2(signed) => signed.verify_v2(),
         }
     }
 
@@ -599,9 +681,9 @@ impl<C: Serialize + DeserializeOwned> Delegation<C> {
     /// v1 serde bytes always start with `0x20` (the length prefix of
     /// the issuer key), and v2 wire tokens start with `0x02`. Version
     /// 32 must never be assigned, it would collide with naked v1.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let signed = match bytes.first() {
-            None => bail!("cannot decode, token is empty"),
+            None => return Err(DecodeError::malformed("token is empty")),
             Some(0x01) => v1::v1_parse::<C>(&bytes[1..])?,
             Some(0x20) => v1::v1_parse::<C>(bytes)?,
             _ => return OpaqueDelegation::decode(bytes)?.try_into(),
@@ -615,15 +697,15 @@ impl<C: Serialize + DeserializeOwned> Delegation<C> {
 
 /// Fails if the capability bytes are not a canonical `C` encoding.
 impl<C: DeserializeOwned> TryFrom<OpaqueDelegation> for Delegation<C> {
-    type Error = anyhow::Error;
+    type Error = DecodeError;
 
-    fn try_from(delegation: OpaqueDelegation) -> Result<Self> {
+    fn try_from(delegation: OpaqueDelegation) -> Result<Self, DecodeError> {
         match postcard::take_from_bytes::<C>(delegation.capability()) {
             Ok((_, [])) => Ok(Self {
                 opaque: delegation,
                 _marker: std::marker::PhantomData,
             }),
-            _ => bail!("capability does not parse in the vocabulary"),
+            _ => Err(e!(DecodeError::ForeignVocabulary)),
         }
     }
 }
@@ -704,13 +786,21 @@ impl OpaqueDelegation {
 
     /// Decode the canonical string form of [`Self::encode_string`]. A
     /// successful decode is signature checked.
-    pub fn decode_string(s: &str) -> Result<Self> {
+    pub fn decode_string(s: &str) -> Result<Self, DecodeError> {
         let bytes = data_encoding::BASE32_NOPAD
             .decode(s.to_ascii_uppercase().as_bytes())
-            .context("invalid base32")?;
-        // The postcard deserializer takes the binary serde path below,
-        // which verifies the signature before yielding.
-        Ok(postcard::from_bytes(&bytes)?)
+            .map_err(DecodeError::malformed)?;
+        let (wire, leftover) =
+            postcard::take_from_bytes::<DelegationWire>(&bytes).map_err(DecodeError::malformed)?;
+        if !leftover.is_empty() {
+            return Err(DecodeError::malformed(format_args!(
+                "{} trailing bytes",
+                leftover.len()
+            )));
+        }
+        let out = Self(wire);
+        out.verify()?;
+        Ok(out)
     }
 }
 
@@ -794,7 +884,7 @@ impl Authorizer {
         invoker: VerifyingKey,
         capability: C,
         proof_chain: &[&OpaqueDelegation],
-    ) -> Result<()> {
+    ) -> Result<(), InvocationError> {
         self.check_opaque_invocation_from_at(SystemTime::now(), invoker, capability, proof_chain)
     }
 
@@ -805,7 +895,7 @@ impl Authorizer {
         invoker: VerifyingKey,
         capability: C,
         proof_chain: &[&OpaqueDelegation],
-    ) -> Result<()> {
+    ) -> Result<(), InvocationError> {
         self.check_invocation_impl(now, invoker, capability_predicate(capability), proof_chain)
     }
 
@@ -819,7 +909,7 @@ impl Authorizer {
         invoker: VerifyingKey,
         capability: C,
         proof_chain: &[&Delegation<C>],
-    ) -> Result<()> {
+    ) -> Result<(), InvocationError> {
         self.check_invocation_from_at(SystemTime::now(), invoker, capability, proof_chain)
     }
 
@@ -830,7 +920,7 @@ impl Authorizer {
         invoker: VerifyingKey,
         capability: C,
         proof_chain: &[&Delegation<C>],
-    ) -> Result<()> {
+    ) -> Result<(), InvocationError> {
         self.check_invocation_impl(now, invoker, capability_predicate(capability), proof_chain)
     }
 
@@ -845,7 +935,7 @@ impl Authorizer {
         invoker: VerifyingKey,
         permitted: impl Fn(&T) -> bool,
         proof_chain: &[T],
-    ) -> Result<()> {
+    ) -> Result<(), InvocationError> {
         // We require that proof chains are provided "back-to-front".
         // So they start with the owner of the capability, then
         // proceed with the next item in the chain.
@@ -854,41 +944,44 @@ impl Authorizer {
             let proof = original.as_ref();
             // Verify proof chain issuer/audience integrity:
             let issuer = proof.issuer();
-            ensure!(
-                issuer == current_issuer_target,
-                "invocation failed: expected proof to be issued by {}, but was issued by {}",
-                hex::encode(current_issuer_target),
-                hex::encode(issuer),
-            );
+            if issuer != current_issuer_target {
+                return Err(e!(InvocationError::ChainBroken {
+                    expected: *current_issuer_target,
+                    found: *issuer,
+                }));
+            }
 
             // Verify each proof's time validity:
             let expiry = proof.expires();
-            ensure!(
-                expiry.is_valid_at(now),
-                "invocation failed: proof expired at {expiry}"
-            );
+            if !expiry.is_valid_at(now) {
+                return Err(e!(InvocationError::Expired {
+                    expiry: expiry.clone(),
+                }));
+            }
 
             // Verify that the capability is actually reached through:
-            ensure!(
-                proof.capability_issuer() == &self.identity,
-                "invocation failed: proof is missing delegation for capability of {}",
-                hex::encode(self.identity)
-            );
+            if proof.capability_issuer() != &self.identity {
+                return Err(e!(InvocationError::WrongCapabilityIssuer {
+                    authorizer: self.identity,
+                }));
+            }
 
             // Verify that the capability doesn't break out of capabilities:
-            ensure!(permitted(original), "invocation failed");
+            if !permitted(original) {
+                return Err(e!(InvocationError::NotPermitted));
+            }
 
             // Continue checking the proof chain's integrity with this
             // delegation's audience as the next issuer target:
             current_issuer_target = proof.audience();
         }
 
-        ensure!(
-            &invoker == current_issuer_target,
-            "invocation failed: expected delegation chain to end in the connection's owner {}, but the connection is authenticated by {} instead",
-            hex::encode(invoker),
-            hex::encode(current_issuer_target),
-        );
+        if &invoker != current_issuer_target {
+            return Err(e!(InvocationError::WrongInvoker {
+                invoker,
+                chain_end: *current_issuer_target,
+            }));
+        }
 
         Ok(())
     }

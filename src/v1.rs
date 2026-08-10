@@ -19,11 +19,11 @@
 //! A naked v1 token is `payload ++ 64 signature bytes`; the versioned
 //! form prefixes `0x01`. The signature covers `DST ++ payload`.
 
-use anyhow::{ensure, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
+use n0_error::e;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{CapabilityOrigin, Expires, Payload, SignatureWire, Signed};
+use crate::{CapabilityOrigin, DecodeError, Expires, Payload, SignatureWire, Signed};
 
 /// The v1 domain separation tag.
 pub(crate) const DST: &[u8] = b"rcan-1-delegation";
@@ -58,13 +58,14 @@ pub(crate) fn v1_encode_versioned(signed: &Signed) -> Vec<u8> {
 }
 
 /// Verify a v1 signature against the reconstructed signed bytes.
-pub(crate) fn v1_verify(signed: &Signed) -> Result<()> {
+pub(crate) fn v1_verify(signed: &Signed) -> Result<(), DecodeError> {
     let mut to_verify = DST.to_vec();
     to_verify.extend_from_slice(&v1_payload_bytes(&signed.payload));
     signed
         .payload
         .issuer
-        .verify_strict(&to_verify, &signed.signature)?;
+        .verify_strict(&to_verify, &signed.signature)
+        .map_err(|_| e!(DecodeError::InvalidSignature))?;
     Ok(())
 }
 
@@ -72,13 +73,17 @@ pub(crate) fn v1_verify(signed: &Signed) -> Result<()> {
 /// verify its signature: postcard deserialization of [`V1Wire`], plus
 /// exact consumption. The capability type is needed to find the end of
 /// the capability field.
-pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<Signed> {
-    let (wire, leftover) = postcard::take_from_bytes::<V1Wire<C>>(bytes).context("decoding v1")?;
-    ensure!(
-        leftover.is_empty(),
-        "cannot decode v1, {} trailing bytes",
-        leftover.len()
-    );
+pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<Signed, DecodeError> {
+    let (wire, leftover) =
+        postcard::take_from_bytes::<V1Wire<C>>(bytes).map_err(DecodeError::malformed)?;
+    if !leftover.is_empty() {
+        return Err(DecodeError::malformed(format_args!(
+            "{} trailing bytes",
+            leftover.len()
+        )));
+    }
     wire.into_signed()
 }
 
@@ -182,7 +187,7 @@ enum V1CapabilityOrigin {
 }
 
 impl<C: Serialize + DeserializeOwned> V1Wire<C> {
-    fn into_signed(self) -> Result<Signed> {
+    fn into_signed(self) -> Result<Signed, DecodeError> {
         let Self(payload, signature) = self;
         let signed = Signed {
             payload: Payload {
@@ -193,7 +198,8 @@ impl<C: Serialize + DeserializeOwned> V1Wire<C> {
                     V1CapabilityOrigin::Delegation(key) => CapabilityOrigin::Delegation(key),
                 },
                 valid_until: payload.valid_until,
-                capability: postcard::to_stdvec(&payload.capability)?,
+                capability: postcard::to_stdvec(&payload.capability)
+                    .map_err(DecodeError::malformed)?,
             },
             signature,
         };
