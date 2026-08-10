@@ -156,7 +156,7 @@ pub(crate) mod signature_serde {
 /// The `Capability` type must be serializable so it can be included in the signature
 /// payload of a [`Delegation`].
 ///
-/// An issuer key must not sign delegations in more than one capability
+/// A capability owner must not sign delegations in more than one capability
 /// vocabulary, unless the vocabulary self-discriminates: delegations
 /// store capabilities as opaque bytes, so nothing else prevents two
 /// vocabularies from colliding on the same encoding.
