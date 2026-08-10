@@ -336,7 +336,10 @@ enum DelegationWire {
 ///   0.4.x, reconstructed.
 /// - serde: the top level framing, versioned via the enum discriminator
 ///   and deserializable without a capability type, but **not** readable
-///   by v1-only code. Signatures are verified on deserialization.
+///   by v1-only code. Human-readable formats (JSON, RON, TOML, ...) get
+///   one opaque string — lowercase base32 of those same framing bytes
+///   ([`Self::encode_string`]) — instead of a per-field structure.
+///   Signatures are verified on deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpaqueDelegation(DelegationWire);
 
@@ -682,12 +685,45 @@ impl<'de, C: DeserializeOwned> Deserialize<'de> for Delegation<C> {
     }
 }
 
+impl OpaqueDelegation {
+    /// Encode into the canonical string form: lowercase base32 (no
+    /// padding) of the postcard serde bytes — the iroh-ticket-style
+    /// encoding, one opaque string instead of a per-field structure.
+    /// This is what serde emits for human-readable formats (JSON, RON,
+    /// TOML, ...).
+    ///
+    /// The encoded bytes are the version-discriminated top framing, not
+    /// the [`Self::encode`] wire form: the framing decodes without a
+    /// capability type in every version.
+    pub fn encode_string(&self) -> String {
+        let bytes = postcard::to_stdvec(&self.0).expect("vec");
+        let mut out = data_encoding::BASE32_NOPAD.encode(&bytes);
+        out.make_ascii_lowercase();
+        out
+    }
+
+    /// Decode the canonical string form of [`Self::encode_string`]. A
+    /// successful decode is signature checked.
+    pub fn decode_string(s: &str) -> Result<Self> {
+        let bytes = data_encoding::BASE32_NOPAD
+            .decode(s.to_ascii_uppercase().as_bytes())
+            .context("invalid base32")?;
+        // The postcard deserializer takes the binary serde path below,
+        // which verifies the signature before yielding.
+        Ok(postcard::from_bytes(&bytes)?)
+    }
+}
+
 impl Serialize for OpaqueDelegation {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.encode_string())
+        } else {
+            self.0.serialize(serializer)
+        }
     }
 }
 
@@ -696,6 +732,10 @@ impl<'de> Deserialize<'de> for OpaqueDelegation {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         use serde::de::Error;
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            return Self::decode_string(&s).map_err(D::Error::custom);
+        }
         let wire = DelegationWire::deserialize(deserializer)?;
         // Verify before yielding, so a deserialized `OpaqueDelegation` is
         // always signature checked, whichever version it is.

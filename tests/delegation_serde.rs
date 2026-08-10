@@ -41,11 +41,8 @@ const V2_POSTCARD: &str = "023b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac
 const V1_CBOR: &str = "a1625631a2677061796c6f6164a5666973737565729820183b186a182718bc18ce18b618a4182d186218a318a818d0182a186f0d187318651832151877181d18e2184318a6183a18c0184818a1188b185918da18296861756469656e63659820188a188818e318dd18740918f1189518fd185218db182d183c18ba185d187218ca18670918bf181d189412181b18f3187418880118b40f186f185c716361706162696c6974795f6f726967696e664973737565726b76616c69645f756e74696ca16241741af48657006a6361706162696c6974798102697369676e61747572659840187e0b1820182418ca18f718fd186518d3188f18a6001876186418ba184518ac18371418db18d005185a18e718970d18660118cb18be18c018440d1832189318fb18ff18e5186d189e18aa187d18ed18df186118e9182f188f18b718d11827182f18db18ac1890182a181d18b518fe189c18f61899188b04";
 const V2_CBOR: &str = "a1625632a2677061796c6f6164a5666973737565729820183b186a182718bc18ce18b618a4182d186218a318a818d0182a186f0d187318651832151877181d18e2184318a6183a18c0184818a1188b185918da18296861756469656e63659820188a188818e318dd18740918f1189518fd185218db182d183c18ba185d187218ca18670918bf181d189412181b18f3187418880118b40f186f185c716361706162696c6974795f6f726967696e664973737565726b76616c69645f756e74696ca16241741af48657006a6361706162696c6974798101697369676e61747572659840188318461818188618f1184c18df18a818b218d60e18aa18b318ce00091887186118aa182b18bf188d18d0182818820f18d518421118bf182c18ca18cc18fc18631852184218760b181c181d0d181d181c189818941835185618f7182518c118e218c718ed18cd189418361856186018e518af1892189f06";
 
-const V1_JSON: &str = r#"{"V1":{"payload":{"issuer":"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29","audience":"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c","capability_origin":"Issuer","valid_until":{"At":4102444800},"capability":[2]},"signature":"7e0b2024caf7fd65d38fa6007664ba45ac3714dbd0055ae7970d6601cbbec0440d3293fbffe56d9eaa7deddf61e92f8fb7d1272fdbac902a1db5fe9cf6998b04"}}"#;
-const V2_JSON: &str = r#"{"V2":{"payload":{"issuer":"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29","audience":"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c","capability_origin":"Issuer","valid_until":{"At":4102444800},"capability":[1]},"signature":"83461886f14cdfa8b2d60eaab3ce00098761aa2bbf8dd028820fd54211bf2ccaccfc635242760b1c1d0d1d1c98943556f725c1e2c7edcd94365660e5af929f06"}}"#;
-
-const V1_RON: &str = r#"V1((payload:(issuer:"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",audience:"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",capability_origin:Issuer,valid_until:At(4102444800),capability:[2]),signature:"7e0b2024caf7fd65d38fa6007664ba45ac3714dbd0055ae7970d6601cbbec0440d3293fbffe56d9eaa7deddf61e92f8fb7d1272fdbac902a1db5fe9cf6998b04"))"#;
-const V2_RON: &str = r#"V2((payload:(issuer:"3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",audience:"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",capability_origin:Issuer,valid_until:At(4102444800),capability:[1]),signature:"83461886f14cdfa8b2d60eaab3ce00098761aa2bbf8dd028820fd54211bf2ccaccfc635242760b1c1d0d1d1c98943556f725c1e2c7edcd94365660e5af929f06"))"#;
+const V1_STRING: &str = "ae5wuj54z23killcuounaktpbvzwkmqvo4o6eq5ghlaerimllhnctcui4poxicprsx6vfwznhs5f24wkm4e36hmucin7g5eiag2a6324aaaybluzuqhqcat6bmqcjsxx7vs5hd5gab3gjosfvq3rjw6qavnopfynmya4xpwaiqgtfe7377sw3hvkpxw56ypjf6h3pujhf7n2zebkdw275hhwtgfqi";
+const V2_STRING: &str = "ai5wuj54z23killcuounaktpbvzwkmqvo4o6eq5ghlaerimllhnctcui4poxicprsx6vfwznhs5f24wkm4e36hmucin7g5eiag2a6324aaaybluzuqhqcamdiymin4km36ulfvqovkz44aajq5q2uk57rxicraqp2vbbdpzmzlgpyy2sij3awha5buorzgeugvlpojob4ld63tmugzlgbznpskpqm";
 
 #[test]
 fn postcard_snapshots() {
@@ -73,19 +70,29 @@ fn cbor_snapshots() {
 }
 
 #[test]
-fn json_snapshots() {
-    for (token, pinned) in [(v1_token(), V1_JSON), (v2_token(), V2_JSON)] {
-        assert_eq!(serde_json::to_string(&token).unwrap(), pinned);
-        let back: OpaqueDelegation = serde_json::from_str(pinned).unwrap();
-        assert_eq!(back, token);
-    }
-}
+fn string_snapshots() {
+    for (token, pinned) in [(v1_token(), V1_STRING), (v2_token(), V2_STRING)] {
+        assert_eq!(token.encode_string(), pinned);
+        assert_eq!(OpaqueDelegation::decode_string(pinned).unwrap(), token);
 
-#[test]
-fn ron_snapshots() {
-    for (token, pinned) in [(v1_token(), V1_RON), (v2_token(), V2_RON)] {
-        assert_eq!(ron::to_string(&token).unwrap(), pinned);
-        let back: OpaqueDelegation = ron::from_str(pinned).unwrap();
+        // Human-readable formats emit the canonical string, quoted.
+        let quoted = format!("{pinned:?}");
+        assert_eq!(serde_json::to_string(&token).unwrap(), quoted);
+        let back: OpaqueDelegation = serde_json::from_str(&quoted).unwrap();
+        assert_eq!(back, token);
+
+        assert_eq!(ron::to_string(&token).unwrap(), quoted);
+        let back: OpaqueDelegation = ron::from_str(&quoted).unwrap();
         assert_eq!(back, token);
     }
+
+    // Tampering with the string fails signature verification on decode.
+    let mut bytes = data_encoding::BASE32_NOPAD
+        .decode(V2_STRING.to_ascii_uppercase().as_bytes())
+        .unwrap();
+    let n = bytes.len();
+    bytes[n - 1] ^= 1;
+    let mut tampered = data_encoding::BASE32_NOPAD.encode(&bytes);
+    tampered.make_ascii_lowercase();
+    assert!(OpaqueDelegation::decode_string(&tampered).is_err());
 }
