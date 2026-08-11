@@ -53,7 +53,7 @@ pub(crate) mod verifying_key_serde {
 /// binary formats like postcard). Binary only: human-readable formats
 /// never see the fields, they get the one canonical string of
 /// [`OpaqueDelegation::encode_string`] instead.
-pub(crate) struct SignatureWire(pub(crate) [u8; SIGNATURE_LENGTH]);
+struct SignatureWire([u8; SIGNATURE_LENGTH]);
 
 impl Serialize for SignatureWire {
     fn serialize<S: serde::Serializer>(
@@ -103,7 +103,7 @@ impl<'de> Deserialize<'de> for SignatureWire {
 
 /// Serde for an ed25519 [`Signature`] via [`SignatureWire`], as a field
 /// attribute.
-pub(crate) mod signature_serde {
+mod signature_serde {
     use ed25519_dalek::Signature;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -287,18 +287,18 @@ pub struct Payload {
     /// The issuer
     #[debug("{}", hex::encode(issuer))]
     #[serde(with = "verifying_key_serde")]
-    pub(crate) issuer: VerifyingKey,
+    issuer: VerifyingKey,
     /// The intended audience
     #[debug("{}", hex::encode(audience))]
     #[serde(with = "verifying_key_serde")]
-    pub(crate) audience: VerifyingKey,
+    audience: VerifyingKey,
     /// The origin of the capability
-    pub(crate) capability_origin: CapabilityOrigin,
+    capability_origin: CapabilityOrigin,
     /// Valid until unix timestamp in seconds.
-    pub(crate) valid_until: Expires,
+    valid_until: Expires,
     /// The capability, as opaque length delimited bytes.
     #[debug("{}", hex::encode(capability))]
-    pub(crate) capability: Vec<u8>,
+    capability: Vec<u8>,
 }
 
 impl Payload {
@@ -335,10 +335,10 @@ impl Payload {
 /// A payload with its signature. What the signature covers depends on
 /// the version of the containing [`DelegationWire`] variant.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub(crate) struct Signed {
-    pub(crate) payload: Payload,
+struct Signed {
+    payload: Payload,
     #[serde(with = "signature_serde")]
-    pub(crate) signature: Signature,
+    signature: Signature,
 }
 
 impl Signed {
