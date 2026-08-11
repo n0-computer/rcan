@@ -87,19 +87,16 @@ pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(
     wire.into_signed()
 }
 
-/// Deserialization of a [`VerifyingKey`] from the v1 encoding: length
-/// prefixed bytes, what serdect produced. Parse only — v1 bytes are
-/// emitted by the byte recipes above, not through serde.
-mod prefixed_key_serde {
-    use ed25519_dalek::VerifyingKey;
-    use serde::{de::Error, Deserializer};
+struct V1VerifyingKey(VerifyingKey);
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
+impl<'de> Deserialize<'de> for V1VerifyingKey {
+    fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> std::result::Result<VerifyingKey, D::Error> {
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
         struct V;
         impl serde::de::Visitor<'_> for V {
-            type Value = VerifyingKey;
+            type Value = V1VerifyingKey;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("32 key bytes")
@@ -109,37 +106,22 @@ mod prefixed_key_serde {
                 let bytes: [u8; 32] = v
                     .try_into()
                     .map_err(|_| E::invalid_length(v.len(), &self))?;
-                VerifyingKey::from_bytes(&bytes).map_err(E::custom)
+                VerifyingKey::from_bytes(&bytes)
+                    .map(V1VerifyingKey)
+                    .map_err(E::custom)
             }
         }
         deserializer.deserialize_bytes(V)
     }
 }
 
-/// The exact wire layout of a v1 `Rcan<C>`: the same field order and
-/// encodings as rcan 0.4.x, with serdect replaced by the wire
-/// compatible [`prefixed_key_serde`]. Parse only — v1 bytes are
-/// emitted by the byte recipes above, not through serde.
-struct V1Wire<C>(V1Payload<C>, Signature);
-
-/// Manual impl so the serde calls match v1's `Rcan` exactly: a plain
-/// 2-tuple, not a tuple struct.
-impl<'de, C: DeserializeOwned> Deserialize<'de> for V1Wire<C> {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        let (payload, SignatureWire(signature)) =
-            <(V1Payload<C>, SignatureWire)>::deserialize(deserializer)?;
-        Ok(Self(payload, Signature::from_bytes(&signature)))
-    }
-}
+#[derive(Deserialize)]
+struct V1Wire<C>(V1Payload<C>, SignatureWire);
 
 #[derive(Deserialize)]
 struct V1Payload<C> {
-    #[serde(with = "prefixed_key_serde")]
-    issuer: VerifyingKey,
-    #[serde(with = "prefixed_key_serde")]
-    audience: VerifyingKey,
+    issuer: V1VerifyingKey,
+    audience: V1VerifyingKey,
     capability_origin: V1CapabilityOrigin,
     capability: C,
     valid_until: Expires,
@@ -148,7 +130,7 @@ struct V1Payload<C> {
 #[derive(Deserialize)]
 enum V1CapabilityOrigin {
     Issuer,
-    Delegation(#[serde(with = "prefixed_key_serde")] VerifyingKey),
+    Delegation(V1VerifyingKey),
 }
 
 impl<C: Serialize + DeserializeOwned> V1Wire<C> {
@@ -156,17 +138,17 @@ impl<C: Serialize + DeserializeOwned> V1Wire<C> {
         let Self(payload, signature) = self;
         let signed = Signed {
             payload: Payload {
-                issuer: payload.issuer,
-                audience: payload.audience,
+                issuer: payload.issuer.0,
+                audience: payload.audience.0,
                 capability_origin: match payload.capability_origin {
                     V1CapabilityOrigin::Issuer => CapabilityOrigin::Issuer,
-                    V1CapabilityOrigin::Delegation(key) => CapabilityOrigin::Delegation(key),
+                    V1CapabilityOrigin::Delegation(key) => CapabilityOrigin::Delegation(key.0),
                 },
                 valid_until: payload.valid_until,
                 capability: postcard::to_stdvec(&payload.capability)
                     .map_err(DecodeError::malformed)?,
             },
-            signature,
+            signature: Signature::from_bytes(&signature.0),
         };
         // Verify before yielding, so a deserialized token is always
         // signature checked.
