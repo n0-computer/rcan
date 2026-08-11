@@ -439,10 +439,10 @@ impl<C> DelegationBuilder<'_, C> {
         };
         let to_sign = postcard::to_extend(&payload, DST.to_vec()).expect("vec");
         let signature = self.issuer.sign(&to_sign);
-        Delegation {
-            opaque: OpaqueDelegation(DelegationData::V2(Signed { payload, signature })),
-            _marker: std::marker::PhantomData,
-        }
+        Delegation::new(OpaqueDelegation(DelegationData::V2(Signed {
+            payload,
+            signature,
+        })))
     }
 }
 
@@ -472,6 +472,14 @@ impl<C> AsRef<OpaqueDelegation> for Delegation<C> {
 }
 
 impl<C> Delegation<C> {
+    /// The vocabulary invariant is the caller's responsibility.
+    fn new(opaque: OpaqueDelegation) -> Self {
+        Self {
+            opaque,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     pub fn opaque(&self) -> &OpaqueDelegation {
         &self.opaque
     }
@@ -552,23 +560,19 @@ impl<C: Serialize + DeserializeOwned> Delegation<C> {
             Some(0x20) => v1::v1_parse::<C>(bytes)?,
             _ => return OpaqueDelegation::decode(bytes)?.try_into(),
         };
-        Ok(Delegation {
-            opaque: OpaqueDelegation(DelegationData::V1(signed)),
-            _marker: std::marker::PhantomData,
-        })
+        Ok(Delegation::new(OpaqueDelegation(DelegationData::V1(
+            signed,
+        ))))
     }
 }
 
 /// Fails if the capability bytes are not a canonical `C` encoding.
-impl<C: DeserializeOwned> TryFrom<OpaqueDelegation> for Delegation<C> {
+impl<C: Serialize + DeserializeOwned> TryFrom<OpaqueDelegation> for Delegation<C> {
     type Error = DecodeError;
 
     fn try_from(delegation: OpaqueDelegation) -> Result<Self, DecodeError> {
         match postcard::take_from_bytes::<C>(delegation.capability()) {
-            Ok((_, [])) => Ok(Self {
-                opaque: delegation,
-                _marker: std::marker::PhantomData,
-            }),
+            Ok((_, [])) => Ok(Self::new(delegation)),
             _ => Err(e!(DecodeError::ForeignVocabulary)),
         }
     }
@@ -597,10 +601,7 @@ impl<C> std::fmt::Debug for Delegation<C> {
 
 impl<C> Clone for Delegation<C> {
     fn clone(&self) -> Self {
-        Self {
-            opaque: self.opaque.clone(),
-            _marker: std::marker::PhantomData,
-        }
+        Self::new(self.opaque.clone())
     }
 }
 
@@ -618,7 +619,7 @@ impl<C> Serialize for Delegation<C> {
     }
 }
 
-impl<'de, C: DeserializeOwned> Deserialize<'de> for Delegation<C> {
+impl<'de, C: Serialize + DeserializeOwned> Deserialize<'de> for Delegation<C> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
         let delegation = OpaqueDelegation::deserialize(deserializer)?;
