@@ -87,76 +87,43 @@ pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(
     wire.into_signed()
 }
 
-/// Serde for a [`VerifyingKey`] in the v1 encoding: length prefixed
-/// bytes in binary formats (what serdect produced), lowercase hex in
-/// human-readable ones.
+/// Deserialization of a [`VerifyingKey`] from the v1 encoding: length
+/// prefixed bytes, what serdect produced. Parse only — v1 bytes are
+/// emitted by the byte recipes above, not through serde.
 mod prefixed_key_serde {
     use ed25519_dalek::VerifyingKey;
-    use serde::{de::Error, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        key: &VerifyingKey,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        if serializer.is_human_readable() {
-            serializer.collect_str(&format_args!("{}", hex::encode(key.as_bytes())))
-        } else {
-            serializer.serialize_bytes(key.as_bytes())
-        }
-    }
+    use serde::{de::Error, Deserializer};
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<VerifyingKey, D::Error> {
-        if deserializer.is_human_readable() {
-            let s = String::deserialize(deserializer)?;
-            let mut buf = [0u8; 32];
-            hex::decode_to_slice(&s, &mut buf).map_err(D::Error::custom)?;
-            VerifyingKey::from_bytes(&buf).map_err(D::Error::custom)
-        } else {
-            struct V;
-            impl serde::de::Visitor<'_> for V {
-                type Value = VerifyingKey;
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = VerifyingKey;
 
-                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    f.write_str("32 key bytes")
-                }
-
-                fn visit_bytes<E: Error>(self, v: &[u8]) -> std::result::Result<Self::Value, E> {
-                    let bytes: [u8; 32] = v
-                        .try_into()
-                        .map_err(|_| E::invalid_length(v.len(), &self))?;
-                    VerifyingKey::from_bytes(&bytes).map_err(E::custom)
-                }
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("32 key bytes")
             }
-            deserializer.deserialize_bytes(V)
+
+            fn visit_bytes<E: Error>(self, v: &[u8]) -> std::result::Result<Self::Value, E> {
+                let bytes: [u8; 32] = v
+                    .try_into()
+                    .map_err(|_| E::invalid_length(v.len(), &self))?;
+                VerifyingKey::from_bytes(&bytes).map_err(E::custom)
+            }
         }
+        deserializer.deserialize_bytes(V)
     }
 }
 
-/// The exact wire layout of a v1 `Rcan<C>`, as plain derived serde:
-/// the same field order and encodings as rcan 0.4.x, with serdect
-/// replaced by the wire compatible [`prefixed_key_serde`]. A tuple
-/// struct because v1's `Rcan` serialized as a 2-tuple (in JSON: an
-/// array of payload and signature).
-
+/// The exact wire layout of a v1 `Rcan<C>`: the same field order and
+/// encodings as rcan 0.4.x, with serdect replaced by the wire
+/// compatible [`prefixed_key_serde`]. Parse only — v1 bytes are
+/// emitted by the byte recipes above, not through serde.
 struct V1Wire<C>(V1Payload<C>, Signature);
 
-/// Manual impls so the serde calls match v1's `Rcan` exactly: a plain
+/// Manual impl so the serde calls match v1's `Rcan` exactly: a plain
 /// 2-tuple, not a tuple struct.
-impl<C: Serialize> Serialize for V1Wire<C> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::SerializeTuple;
-        let mut tup = serializer.serialize_tuple(2)?;
-        tup.serialize_element(&self.0)?;
-        tup.serialize_element(&SignatureWire(self.1.to_bytes()))?;
-        tup.end()
-    }
-}
-
 impl<'de, C: DeserializeOwned> Deserialize<'de> for V1Wire<C> {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -167,8 +134,7 @@ impl<'de, C: DeserializeOwned> Deserialize<'de> for V1Wire<C> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename = "Payload")]
+#[derive(Deserialize)]
 struct V1Payload<C> {
     #[serde(with = "prefixed_key_serde")]
     issuer: VerifyingKey,
@@ -179,8 +145,7 @@ struct V1Payload<C> {
     valid_until: Expires,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename = "CapabilityOrigin")]
+#[derive(Deserialize)]
 enum V1CapabilityOrigin {
     Issuer,
     Delegation(#[serde(with = "prefixed_key_serde")] VerifyingKey),
