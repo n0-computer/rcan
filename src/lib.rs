@@ -622,8 +622,16 @@ impl<C> Serialize for Delegation<C> {
 impl<'de, C: Serialize + DeserializeOwned> Deserialize<'de> for Delegation<C> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-        let delegation = OpaqueDelegation::deserialize(deserializer)?;
-        Self::try_from(delegation).map_err(D::Error::custom)
+        if deserializer.is_human_readable() {
+            // The C-free top framing, then the vocabulary check.
+            let opaque = OpaqueDelegation::deserialize(deserializer)?;
+            Self::try_from(opaque).map_err(Error::custom)
+        } else {
+            // The binary form wraps the wire bytes; the C-typed decode
+            // reads v1 (which needs the capability type) as well as v2.
+            let bytes = Vec::<u8>::deserialize(deserializer)?;
+            Self::decode(&bytes).map_err(Error::custom)
+        }
     }
 }
 
@@ -669,7 +677,7 @@ impl Serialize for OpaqueDelegation {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
         } else {
-            self.0.serialize(serializer)
+            self.encode().serialize(serializer)
         }
     }
 }
@@ -679,13 +687,11 @@ impl<'de> Deserialize<'de> for OpaqueDelegation {
         use serde::de::Error;
         if deserializer.is_human_readable() {
             let s = String::deserialize(deserializer)?;
-            return Self::decode_string(&s).map_err(D::Error::custom);
+            Self::decode_string(&s).map_err(D::Error::custom)
+        } else {
+            let v = Vec::<u8>::deserialize(deserializer)?;
+            Self::decode(&v).map_err(D::Error::custom)
         }
-        let out = Self(DelegationData::deserialize(deserializer)?);
-        // Verify before yielding, so a deserialized `OpaqueDelegation` is
-        // always signature checked, whichever version it is.
-        out.verify().map_err(D::Error::custom)?;
-        Ok(out)
     }
 }
 
@@ -1031,9 +1037,10 @@ mod tests {
         assert_eq!(delegation.capability(), &[1]);
         assert!(!delegation.is_v1());
 
-        // For v2, the serde form equals the wire form.
+        // The binary serde form wraps the wire form (encode()) as a
+        // byte string: the wire bytes behind a postcard length prefix.
         let wire = postcard::to_stdvec(&delegation).unwrap();
-        assert_eq!(wire, bytes);
+        assert!(wire.ends_with(&bytes));
         let deserialized: OpaqueDelegation = postcard::from_bytes(&wire).unwrap();
         assert_eq!(deserialized, delegation);
     }
@@ -1134,33 +1141,34 @@ mod tests {
     }
 
     #[test]
-    fn v1_serde_roundtrip_in_top_level_framing() {
+    fn v1_serde_roundtrip_typed() {
         let naked = hex::decode(V1_ROOT_NAKED).unwrap();
-        let delegation = Delegation::<Rpc>::decode(&naked).unwrap().into_opaque();
+        let delegation = Delegation::<Rpc>::decode(&naked).unwrap();
 
-        // The serde form is the top level framing: version discriminator
-        // 1, then the v2 style struct. Not readable as v1 wire bytes,
-        // but needs no capability type to deserialize.
+        // A v1 token needs the capability type to be read back, so it
+        // round-trips through the typed `Delegation<C>`, not the C-free
+        // `OpaqueDelegation`. The binary serde form wraps `encode()` (the
+        // versioned v1 wire form) as a byte string.
         let wire = postcard::to_stdvec(&delegation).unwrap();
-        assert_eq!(wire[0], 1);
-        assert_ne!(wire, naked);
-        let deserialized: OpaqueDelegation = postcard::from_bytes(&wire).unwrap();
+        assert!(wire.ends_with(&delegation.opaque().encode()));
+        let deserialized: Delegation<Rpc> = postcard::from_bytes(&wire).unwrap();
         assert_eq!(deserialized, delegation);
 
-        // After the round trip, the versioned v1 bytes are still exactly
-        // reconstructible.
+        // encode() still reconstructs the exact versioned v1 wire bytes.
         assert_eq!(
-            deserialized.encode(),
+            deserialized.opaque().encode(),
             hex::decode(V1_ROOT_VERSIONED).unwrap()
         );
 
-        // Tampering with the serde form fails signature verification on
-        // deserialize: flip a byte in the capability, which sits right
-        // before the 64 byte signature.
+        // The C-free `OpaqueDelegation` cannot read a v1 token from its
+        // binary serde form: no capability type.
+        assert!(postcard::from_bytes::<OpaqueDelegation>(&wire).is_err());
+
+        // Tampering fails signature verification on deserialize.
         let mut tampered = wire.clone();
         let n = tampered.len();
         tampered[n - 65] ^= 1;
-        assert!(postcard::from_bytes::<OpaqueDelegation>(&tampered).is_err());
+        assert!(postcard::from_bytes::<Delegation<Rpc>>(&tampered).is_err());
     }
 
     #[test]
