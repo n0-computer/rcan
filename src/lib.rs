@@ -944,8 +944,6 @@ enum DelegationWire<T> {
     V2(T),
 }
 
-/// An uninhabited type: variants holding it can never be constructed or
-/// deserialized.
 #[derive(Serialize, Deserialize)]
 enum Never {}
 
@@ -961,8 +959,6 @@ impl Serialize for DelegationData {
 
 impl<'de> Deserialize<'de> for DelegationData {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Total thanks to `V0`'s uninhabited payload: wire to data
-        // cannot fail.
         Ok(match DelegationWire::deserialize(deserializer)? {
             DelegationWire::V0(never) => match never {},
             DelegationWire::V1(signed) => Self::V1(signed),
