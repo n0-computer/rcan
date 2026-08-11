@@ -233,7 +233,7 @@ impl Payload {
 }
 
 /// A payload with its signature. What the signature covers depends on
-/// the version of the containing [`DelegationWire`] variant.
+/// the version of the containing [`DelegationData`] variant.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 struct Signed {
     payload: Payload,
@@ -257,27 +257,15 @@ impl Signed {
     }
 }
 
-/// An uninhabited type: variants holding it can never be constructed or
-/// deserialized.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum Never {}
-
-/// The versioned form of a delegation: the in-memory repr of
-/// [`OpaqueDelegation`] and its serde form.
-///
-/// The postcard enum discriminator doubles as the version byte: variant
-/// indices equal version numbers.
+/// The versioned in-memory repr of [`OpaqueDelegation`].
 ///
 /// Note that the `V1` variant's serde form is the top level framing
 /// (v2 style field encodings), not a v1 wire form — v1 wire bytes can
 /// only be read via [`Delegation::decode`], with a capability type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-// transient and short-lived; boxing buys nothing
-#[allow(clippy::large_enum_variant)]
-enum DelegationWire {
-    /// A version that never existed; pins the variant indices to the
-    /// version numbers. Never constructed.
-    V0(Never),
+/// The serde form is [`DelegationWire`], which pins the variant
+/// indices to the version numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DelegationData {
     /// A v1 token. Signed over `v1 DST ++ v1 payload layout`.
     V1(Signed),
     /// A v2 token. Signed over `DST ++ postcard(payload)`.
@@ -306,7 +294,7 @@ enum DelegationWire {
 ///   ([`Self::encode_string`]) — instead of a per-field structure.
 ///   Signatures are verified on deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpaqueDelegation(DelegationWire);
+pub struct OpaqueDelegation(DelegationData);
 
 pub struct DelegationBuilder<'s, C> {
     issuer: &'s SigningKey,
@@ -358,7 +346,7 @@ impl OpaqueDelegation {
             None => Err(DecodeError::malformed("token is empty")),
             Some(0x01) | Some(0x20) => Err(e!(DecodeError::V1NeedsCapability)),
             _ => {
-                let (wire, leftover) = postcard::take_from_bytes::<DelegationWire>(bytes)
+                let (wire, leftover) = postcard::take_from_bytes::<DelegationData>(bytes)
                     .map_err(DecodeError::malformed)?;
                 if !leftover.is_empty() {
                     return Err(DecodeError::malformed(format_args!(
@@ -376,9 +364,8 @@ impl OpaqueDelegation {
     /// Verify the signature, whichever version this is.
     fn verify(&self) -> Result<(), DecodeError> {
         match &self.0 {
-            DelegationWire::V0(never) => match *never {},
-            DelegationWire::V1(signed) => v1::v1_verify(signed),
-            DelegationWire::V2(signed) => signed.verify_v2(),
+            DelegationData::V1(signed) => v1::v1_verify(signed),
+            DelegationData::V2(signed) => signed.verify_v2(),
         }
     }
 
@@ -386,22 +373,20 @@ impl OpaqueDelegation {
     /// `Rcan::encode` form of rcan 0.4.x, reconstructed.
     pub fn encode(&self) -> Vec<u8> {
         match &self.0 {
-            DelegationWire::V0(never) => match *never {},
-            DelegationWire::V1(signed) => v1::v1_encode_versioned(signed),
-            DelegationWire::V2(_) => postcard::to_stdvec(&self.0).expect("vec"),
+            DelegationData::V1(signed) => v1::v1_encode_versioned(signed),
+            DelegationData::V2(_) => postcard::to_stdvec(&self.0).expect("vec"),
         }
     }
 
     pub(crate) fn signed(&self) -> &Signed {
         match &self.0 {
-            DelegationWire::V0(never) => match *never {},
-            DelegationWire::V1(signed) | DelegationWire::V2(signed) => signed,
+            DelegationData::V1(signed) | DelegationData::V2(signed) => signed,
         }
     }
 
     /// Whether this is a v1 token.
     pub fn is_v1(&self) -> bool {
-        matches!(self.0, DelegationWire::V1(_))
+        matches!(self.0, DelegationData::V1(_))
     }
 
     pub fn payload(&self) -> &Payload {
@@ -455,7 +440,7 @@ impl<C> DelegationBuilder<'_, C> {
         let to_sign = postcard::to_extend(&payload, DST.to_vec()).expect("vec");
         let signature = self.issuer.sign(&to_sign);
         Delegation {
-            opaque: OpaqueDelegation(DelegationWire::V2(Signed { payload, signature })),
+            opaque: OpaqueDelegation(DelegationData::V2(Signed { payload, signature })),
             _marker: std::marker::PhantomData,
         }
     }
@@ -568,7 +553,7 @@ impl<C: Serialize + DeserializeOwned> Delegation<C> {
             _ => return OpaqueDelegation::decode(bytes)?.try_into(),
         };
         Ok(Delegation {
-            opaque: OpaqueDelegation(DelegationWire::V1(signed)),
+            opaque: OpaqueDelegation(DelegationData::V1(signed)),
             _marker: std::marker::PhantomData,
         })
     }
@@ -665,7 +650,7 @@ impl OpaqueDelegation {
             .decode(s.to_ascii_uppercase().as_bytes())
             .map_err(DecodeError::malformed)?;
         let (wire, leftover) =
-            postcard::take_from_bytes::<DelegationWire>(&bytes).map_err(DecodeError::malformed)?;
+            postcard::take_from_bytes::<DelegationData>(&bytes).map_err(DecodeError::malformed)?;
         if !leftover.is_empty() {
             return Err(DecodeError::malformed(format_args!(
                 "{} trailing bytes",
@@ -695,15 +680,11 @@ impl<'de> Deserialize<'de> for OpaqueDelegation {
             let s = String::deserialize(deserializer)?;
             return Self::decode_string(&s).map_err(D::Error::custom);
         }
-        let wire = DelegationWire::deserialize(deserializer)?;
+        let out = Self(DelegationData::deserialize(deserializer)?);
         // Verify before yielding, so a deserialized `OpaqueDelegation` is
         // always signature checked, whichever version it is.
-        match &wire {
-            DelegationWire::V0(never) => match *never {},
-            DelegationWire::V1(signed) => v1::v1_verify(signed).map_err(D::Error::custom)?,
-            DelegationWire::V2(signed) => signed.verify_v2().map_err(D::Error::custom)?,
-        }
-        Ok(Self(wire))
+        out.verify().map_err(D::Error::custom)?;
+        Ok(out)
     }
 }
 
@@ -732,6 +713,9 @@ pub struct Authorizer {
     identity: VerifyingKey,
 }
 
+// The Err path of an auth check is cold; the keys in the error are
+// worth more than a small Result.
+#[allow(clippy::result_large_err)]
 impl Authorizer {
     /// Constructs a new authorizer for given identity.
     pub fn new(identity: VerifyingKey) -> Self {
@@ -856,8 +840,6 @@ impl Authorizer {
     }
 }
 
-mod wire {}
-
 /// Stable serde for [`VerifyingKey`]: 32 raw bytes, no length prefix —
 /// the length is fixed. Pins the wire format independent of
 /// [`ed25519_dalek`]'s own serde impl. Binary only: human-readable
@@ -945,6 +927,47 @@ mod signature_serde {
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Signature, D::Error> {
         let SignatureWire(bytes) = SignatureWire::deserialize(deserializer)?;
         Ok(Signature::from_bytes(&bytes))
+    }
+}
+
+/// The wire layout of [`DelegationData`]: the same variants, plus the
+/// reserved version 0, whose uninhabited payload pins the variant
+/// indices to the version numbers. Lives only at the serde boundary;
+/// everything else works with [`DelegationData`].
+///
+/// Generic over the payload so that serializing borrows the signed
+/// data and deserializing owns it.
+#[derive(Serialize, Deserialize)]
+enum DelegationWire<T> {
+    V0(Never),
+    V1(T),
+    V2(T),
+}
+
+/// An uninhabited type: variants holding it can never be constructed or
+/// deserialized.
+#[derive(Serialize, Deserialize)]
+enum Never {}
+
+impl Serialize for DelegationData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::V1(signed) => DelegationWire::V1(signed),
+            Self::V2(signed) => DelegationWire::V2(signed),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DelegationData {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Total thanks to `V0`'s uninhabited payload: wire to data
+        // cannot fail.
+        Ok(match DelegationWire::deserialize(deserializer)? {
+            DelegationWire::V0(never) => match never {},
+            DelegationWire::V1(signed) => Self::V1(signed),
+            DelegationWire::V2(signed) => Self::V2(signed),
+        })
     }
 }
 
