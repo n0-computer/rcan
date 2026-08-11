@@ -24,106 +24,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// Domain separation tag for v2 signatures.
 pub const DST: &[u8] = b"rcan-2-delegation";
 
-/// Stable serde for [`VerifyingKey`]: 32 raw bytes, no length prefix —
-/// the length is fixed. Pins the wire format independent of
-/// [`ed25519_dalek`]'s own serde impl. Binary only: human-readable
-/// formats never see the fields, they get the one canonical string of
-/// [`OpaqueDelegation::encode_string`] instead.
-pub(crate) mod verifying_key_serde {
-    use ed25519_dalek::VerifyingKey;
-    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        key: &VerifyingKey,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        key.as_bytes().serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<VerifyingKey, D::Error> {
-        let buf = <[u8; 32]>::deserialize(deserializer)?;
-        VerifyingKey::from_bytes(&buf).map_err(D::Error::custom)
-    }
-}
-
-/// Wire-format wrapper around an ed25519 [`Signature`] that serializes as
-/// a fixed-length tuple of `SIGNATURE_LENGTH` bytes (no length prefix in
-/// binary formats like postcard). Binary only: human-readable formats
-/// never see the fields, they get the one canonical string of
-/// [`OpaqueDelegation::encode_string`] instead.
-struct SignatureWire([u8; SIGNATURE_LENGTH]);
-
-impl Serialize for SignatureWire {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        // A flat tuple of 64 bytes, like v1's SignatureWire: serde has
-        // no built-in impls for arrays over 32, hence the loop and the
-        // visitor below.
-        use serde::ser::SerializeTuple;
-        let mut tup = serializer.serialize_tuple(SIGNATURE_LENGTH)?;
-        for byte in &self.0 {
-            tup.serialize_element(byte)?;
-        }
-        tup.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for SignatureWire {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        struct V;
-        impl<'de> serde::de::Visitor<'de> for V {
-            type Value = SignatureWire;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "an ed25519 signature ({SIGNATURE_LENGTH} bytes)")
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                let mut bytes = [0u8; SIGNATURE_LENGTH];
-                for (i, slot) in bytes.iter_mut().enumerate() {
-                    *slot = seq
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
-                }
-                Ok(SignatureWire(bytes))
-            }
-        }
-        deserializer.deserialize_tuple(SIGNATURE_LENGTH, V)
-    }
-}
-
-/// Serde for an ed25519 [`Signature`] via [`SignatureWire`], as a field
-/// attribute.
-mod signature_serde {
-    use ed25519_dalek::Signature;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    use crate::SignatureWire;
-
-    pub fn serialize<S: Serializer>(
-        signature: &Signature,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        SignatureWire(signature.to_bytes()).serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Signature, D::Error> {
-        let SignatureWire(bytes) = SignatureWire::deserialize(deserializer)?;
-        Ok(Signature::from_bytes(&bytes))
-    }
-}
-
 /// A trait for types that define a capability.
 ///
 /// Capabilities can be compared using [`Capability::permits`], which determines
@@ -728,18 +628,13 @@ impl<C> PartialEq for Delegation<C> {
 impl<C> Eq for Delegation<C> {}
 
 impl<C> Serialize for Delegation<C> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.opaque.serialize(serializer)
     }
 }
 
 impl<'de, C: DeserializeOwned> Deserialize<'de> for Delegation<C> {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
         let delegation = OpaqueDelegation::deserialize(deserializer)?;
         Self::try_from(delegation).map_err(D::Error::custom)
@@ -784,10 +679,7 @@ impl OpaqueDelegation {
 }
 
 impl Serialize for OpaqueDelegation {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
         } else {
@@ -797,9 +689,7 @@ impl Serialize for OpaqueDelegation {
 }
 
 impl<'de> Deserialize<'de> for OpaqueDelegation {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
         if deserializer.is_human_readable() {
             let s = String::deserialize(deserializer)?;
@@ -963,6 +853,98 @@ impl Authorizer {
         }
 
         Ok(())
+    }
+}
+
+mod wire {}
+
+/// Stable serde for [`VerifyingKey`]: 32 raw bytes, no length prefix —
+/// the length is fixed. Pins the wire format independent of
+/// [`ed25519_dalek`]'s own serde impl. Binary only: human-readable
+/// formats never see the fields, they get the one canonical string of
+/// [`OpaqueDelegation::encode_string`] instead.
+pub(crate) mod verifying_key_serde {
+    use ed25519_dalek::VerifyingKey;
+    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(key: &VerifyingKey, serializer: S) -> Result<S::Ok, S::Error> {
+        key.as_bytes().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<VerifyingKey, D::Error> {
+        let buf = <[u8; 32]>::deserialize(deserializer)?;
+        VerifyingKey::from_bytes(&buf).map_err(D::Error::custom)
+    }
+}
+
+/// Wire-format wrapper around an ed25519 [`Signature`] that serializes as
+/// a fixed-length tuple of `SIGNATURE_LENGTH` bytes (no length prefix in
+/// binary formats like postcard). Binary only: human-readable formats
+/// never see the fields, they get the one canonical string of
+/// [`OpaqueDelegation::encode_string`] instead.
+struct SignatureWire([u8; SIGNATURE_LENGTH]);
+
+impl Serialize for SignatureWire {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // A flat tuple of 64 bytes, like v1's SignatureWire: serde has
+        // no built-in impls for arrays over 32, hence the loop and the
+        // visitor below.
+        use serde::ser::SerializeTuple;
+        let mut tup = serializer.serialize_tuple(SIGNATURE_LENGTH)?;
+        for byte in &self.0 {
+            tup.serialize_element(byte)?;
+        }
+        tup.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SignatureWire {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = SignatureWire;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "an ed25519 signature ({SIGNATURE_LENGTH} bytes)")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut bytes = [0u8; SIGNATURE_LENGTH];
+                for (i, slot) in bytes.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(SignatureWire(bytes))
+            }
+        }
+        deserializer.deserialize_tuple(SIGNATURE_LENGTH, V)
+    }
+}
+
+/// Serde for an ed25519 [`Signature`] via [`SignatureWire`], as a field
+/// attribute.
+mod signature_serde {
+    use ed25519_dalek::Signature;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::SignatureWire;
+
+    pub fn serialize<S: Serializer>(
+        signature: &Signature,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        SignatureWire(signature.to_bytes()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Signature, D::Error> {
+        let SignatureWire(bytes) = SignatureWire::deserialize(deserializer)?;
+        Ok(Signature::from_bytes(&bytes))
     }
 }
 

@@ -90,9 +90,7 @@ pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(
 struct V1VerifyingKey(VerifyingKey);
 
 impl<'de> Deserialize<'de> for V1VerifyingKey {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
         struct V;
         impl serde::de::Visitor<'_> for V {
@@ -102,7 +100,7 @@ impl<'de> Deserialize<'de> for V1VerifyingKey {
                 f.write_str("32 key bytes")
             }
 
-            fn visit_bytes<E: Error>(self, v: &[u8]) -> std::result::Result<Self::Value, E> {
+            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
                 let bytes: [u8; 32] = v
                     .try_into()
                     .map_err(|_| E::invalid_length(v.len(), &self))?;
