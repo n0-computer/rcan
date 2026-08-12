@@ -19,6 +19,7 @@ use ed25519_dalek::{
 };
 use n0_error::{e, stack_error};
 use n0_future::time::{Duration, SystemTime};
+use postcard::take_from_bytes;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// Domain separation tag for v2 signatures.
@@ -234,27 +235,10 @@ impl Payload {
 
 /// A payload with its signature. What the signature covers depends on
 /// the version of the containing [`DelegationData`] variant.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Signed {
     payload: Payload,
-    #[serde(with = "signature_serde")]
     signature: Signature,
-}
-
-impl Signed {
-    /// The v2 signed bytes: `DST ++ postcard(payload)`.
-    fn signed_bytes_v2(&self) -> Vec<u8> {
-        postcard::to_extend(&self.payload, DST.to_vec()).expect("vec")
-    }
-
-    /// Verify as a v2 token.
-    fn verify_v2(&self) -> Result<(), DecodeError> {
-        self.payload
-            .issuer
-            .verify_strict(&self.signed_bytes_v2(), &self.signature)
-            .map_err(|_| e!(DecodeError::InvalidSignature))?;
-        Ok(())
-    }
 }
 
 /// The versioned in-memory repr of [`OpaqueDelegation`].
@@ -335,47 +319,69 @@ impl<C: Serialize> Delegation<C> {
     }
 }
 
+fn read_signed<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Signature), DecodeError> {
+    let (payload, signature) = take_from_bytes::<T>(bytes).map_err(DecodeError::malformed)?;
+    let signature = Signature::from_bytes(
+        signature
+            .try_into()
+            .map_err(|_| DecodeError::malformed("invalid signature length"))?,
+    );
+    Ok((payload, signature))
+}
+
+fn append_postcard<T: Serialize>(payload: &T, dst: &mut Vec<u8>) {
+    postcard::to_io(payload, dst).expect("postcard ser failed");
+}
+
 impl OpaqueDelegation {
+    fn decode_v2(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let (payload, signature) = read_signed::<Payload>(bytes)?;
+        let mut to_verify = DST.to_vec();
+        append_postcard(&payload, &mut to_verify);
+        if to_verify[DST.len()..] != bytes[..bytes.len() - SIGNATURE_LENGTH] {
+            return Err(DecodeError::malformed("non canonical encoding of payload"));
+        }
+        payload
+            .issuer
+            .verify_strict(&to_verify, &signature)
+            .map_err(|_| e!(DecodeError::InvalidSignature))?;
+        Ok(Self(DelegationData::V2(Signed { payload, signature })))
+    }
+
     /// Decode a token of version >= 2. A successful decode is signature
     /// checked, and the input must be consumed exactly.
     ///
     /// v1 tokens are rejected: deserializing them requires the
     /// capability type, use [`Delegation::decode`].
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        match bytes.first() {
+        match bytes.split_first() {
             None => Err(DecodeError::malformed("token is empty")),
-            Some(0x01) | Some(0x20) => Err(e!(DecodeError::V1NeedsCapability)),
-            _ => {
-                let (wire, leftover) = postcard::take_from_bytes::<DelegationData>(bytes)
-                    .map_err(DecodeError::malformed)?;
-                if !leftover.is_empty() {
-                    return Err(DecodeError::malformed(format_args!(
-                        "{} trailing bytes",
-                        leftover.len()
-                    )));
-                }
-                let out = Self(wire);
-                out.verify()?;
-                Ok(out)
-            }
-        }
-    }
-
-    /// Verify the signature, whichever version this is.
-    fn verify(&self) -> Result<(), DecodeError> {
-        match &self.0 {
-            DelegationData::V1(signed) => v1::v1_verify(signed),
-            DelegationData::V2(signed) => signed.verify_v2(),
+            Some((0x01, _)) | Some((0x20, _)) => Err(e!(DecodeError::V1NeedsCapability)),
+            Some((0x02, bytes)) => Self::decode_v2(bytes),
+            Some((v, _)) => Err(DecodeError::malformed(format!(
+                "unknown version byte {:#x}",
+                v
+            ))),
         }
     }
 
     /// Encode in the versioned wire form. For v1 tokens this is the
     /// `Rcan::encode` form of rcan 0.4.x, reconstructed.
     pub fn encode(&self) -> Vec<u8> {
+        let mut res = Vec::new();
         match &self.0 {
-            DelegationData::V1(signed) => v1::v1_encode_versioned(signed),
-            DelegationData::V2(_) => postcard::to_stdvec(&self.0).expect("vec"),
+            DelegationData::V1(signed) => {
+                res.push(1u8);
+                v1::v1_payload_bytes(&signed.payload, &mut res);
+                res.extend_from_slice(&signed.signature.to_bytes());
+            }
+            DelegationData::V2(signed) => {
+                res.push(2u8);
+                append_postcard(&signed.payload, &mut res);
+                res.extend_from_slice(&signed.signature.to_bytes());
+            }
         }
+        res
     }
 
     pub(crate) fn signed(&self) -> &Signed {
@@ -439,10 +445,7 @@ impl<C> DelegationBuilder<'_, C> {
         };
         let to_sign = postcard::to_extend(&payload, DST.to_vec()).expect("vec");
         let signature = self.issuer.sign(&to_sign);
-        Delegation::new(OpaqueDelegation(DelegationData::V2(Signed {
-            payload,
-            signature,
-        })))
+        Delegation::v2(Signed { payload, signature })
     }
 }
 
@@ -478,6 +481,14 @@ impl<C> Delegation<C> {
             opaque,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    fn v1(signed: Signed) -> Self {
+        Self::new(OpaqueDelegation(DelegationData::V1(signed)))
+    }
+
+    fn v2(signed: Signed) -> Self {
+        Self::new(OpaqueDelegation(DelegationData::V2(signed)))
     }
 
     pub fn opaque(&self) -> &OpaqueDelegation {
@@ -531,38 +542,48 @@ impl<C> Delegation<C> {
     }
 }
 
-impl<C: DeserializeOwned> Delegation<C> {
+impl<C: Serialize + DeserializeOwned> Delegation<C> {
     /// The capability. Infallible: the type's invariant guarantees the
     /// bytes parse.
     pub fn capability(&self) -> C {
         postcard::from_bytes(self.opaque.capability()).expect("invariant: capability parses as C")
     }
-}
 
-impl<C: Serialize + DeserializeOwned> Delegation<C> {
     /// Decode a token of any supported version in the vocabulary `C`.
     ///
-    /// The capability bytes are validated as a canonical `C` encoding
-    /// for every version (v1 needs `C` to parse at all; for v2 the
-    /// check is the conversion from [`OpaqueDelegation`]). Use
-    /// [`into_opaque`](Self::into_opaque) where the untyped
-    /// form is wanted; [`OpaqueDelegation::decode`] decodes v2 tokens without
-    /// a vocabulary.
+    /// The capability bytes must parse as `C`, consumed exactly (v1
+    /// needs `C` to parse at all; for v2 the parse is the conversion
+    /// from [`OpaqueDelegation`]). v2 additionally rejects non-canonical
+    /// framing; v1 is read as leniently as rcan 0.4 wrote it. Use
+    /// [`into_opaque`](Self::into_opaque) where the untyped form is
+    /// wanted; [`OpaqueDelegation::decode`] decodes v2 tokens without a
+    /// vocabulary.
     ///
     /// Version detection: v1 versioned tokens start with `0x01`, naked
     /// v1 serde bytes always start with `0x20` (the length prefix of
     /// the issuer key), and v2 wire tokens start with `0x02`. Version
     /// 32 must never be assigned, it would collide with naked v1.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let signed = match bytes.first() {
-            None => return Err(DecodeError::malformed("token is empty")),
-            Some(0x01) => v1::v1_parse::<C>(&bytes[1..])?,
-            Some(0x20) => v1::v1_parse::<C>(bytes)?,
-            _ => return OpaqueDelegation::decode(bytes)?.try_into(),
-        };
-        Ok(Delegation::new(OpaqueDelegation(DelegationData::V1(
-            signed,
-        ))))
+        match bytes.split_first() {
+            None => Err(DecodeError::malformed("token is empty")),
+            Some((0x01, rest)) => Ok(Delegation::v1(v1::parse_and_verify::<C>(rest)?)),
+            Some((0x20, _)) => Ok(Delegation::v1(v1::parse_and_verify::<C>(bytes)?)),
+            Some((0x02, _)) => {
+                let delegation = OpaqueDelegation::decode(bytes)?;
+                let delegation = Delegation::<C>::try_from(delegation)?;
+                Ok(delegation)
+            }
+            Some((v, _)) => Err(DecodeError::malformed(format!(
+                "unknown version byte {:#x}",
+                v
+            ))),
+        }
+    }
+
+    /// Decode the canonical string form. Reads v1 and v2, in the
+    /// vocabulary `C`.
+    pub fn decode_string(s: &str) -> Result<Self, DecodeError> {
+        Self::decode(&base32_bytes(s)?)
     }
 }
 
@@ -622,45 +643,34 @@ impl<C> Serialize for Delegation<C> {
 impl<'de, C: Serialize + DeserializeOwned> Deserialize<'de> for Delegation<C> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-        let delegation = OpaqueDelegation::deserialize(deserializer)?;
-        Self::try_from(delegation).map_err(D::Error::custom)
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            Self::decode_string(&s).map_err(Error::custom)
+        } else {
+            let bytes = Vec::<u8>::deserialize(deserializer)?;
+            Self::decode(&bytes).map_err(Error::custom)
+        }
     }
 }
 
 impl OpaqueDelegation {
     /// Encode into the canonical string form: lowercase base32 (no
-    /// padding) of the postcard serde bytes — the iroh-ticket-style
-    /// encoding, one opaque string instead of a per-field structure.
-    /// This is what serde emits for human-readable formats (JSON, RON,
-    /// TOML, ...).
-    ///
-    /// The encoded bytes are the version-discriminated top framing, not
-    /// the [`Self::encode`] wire form: the framing decodes without a
-    /// capability type in every version.
+    /// padding) of the wire form ([`Self::encode`]) — the iroh-ticket
+    /// style, one opaque string instead of a per-field structure. This
+    /// is what serde emits for human-readable formats (JSON, RON, TOML,
+    /// ...).
     pub fn encode_string(&self) -> String {
-        let bytes = postcard::to_stdvec(&self.0).expect("vec");
-        let mut out = data_encoding::BASE32_NOPAD.encode(&bytes);
+        let mut out = data_encoding::BASE32_NOPAD.encode(&self.encode());
         out.make_ascii_lowercase();
         out
     }
 
     /// Decode the canonical string form of [`Self::encode_string`]. A
-    /// successful decode is signature checked.
+    /// successful decode is signature checked. Like [`Self::decode`],
+    /// v1 tokens are rejected — they need a capability type; use
+    /// [`Delegation::decode_string`].
     pub fn decode_string(s: &str) -> Result<Self, DecodeError> {
-        let bytes = data_encoding::BASE32_NOPAD
-            .decode(s.to_ascii_uppercase().as_bytes())
-            .map_err(DecodeError::malformed)?;
-        let (wire, leftover) =
-            postcard::take_from_bytes::<DelegationData>(&bytes).map_err(DecodeError::malformed)?;
-        if !leftover.is_empty() {
-            return Err(DecodeError::malformed(format_args!(
-                "{} trailing bytes",
-                leftover.len()
-            )));
-        }
-        let out = Self(wire);
-        out.verify()?;
-        Ok(out)
+        Self::decode(&base32_bytes(s)?)
     }
 }
 
@@ -669,7 +679,7 @@ impl Serialize for OpaqueDelegation {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
         } else {
-            self.0.serialize(serializer)
+            self.encode().serialize(serializer)
         }
     }
 }
@@ -679,13 +689,11 @@ impl<'de> Deserialize<'de> for OpaqueDelegation {
         use serde::de::Error;
         if deserializer.is_human_readable() {
             let s = String::deserialize(deserializer)?;
-            return Self::decode_string(&s).map_err(D::Error::custom);
+            Self::decode_string(&s).map_err(D::Error::custom)
+        } else {
+            let v = Vec::<u8>::deserialize(deserializer)?;
+            Self::decode(&v).map_err(D::Error::custom)
         }
-        let out = Self(DelegationData::deserialize(deserializer)?);
-        // Verify before yielding, so a deserialized `OpaqueDelegation` is
-        // always signature checked, whichever version it is.
-        out.verify().map_err(D::Error::custom)?;
-        Ok(out)
     }
 }
 
@@ -862,114 +870,17 @@ pub(crate) mod verifying_key_serde {
     }
 }
 
-/// Wire-format wrapper around an ed25519 [`Signature`] that serializes as
-/// a fixed-length tuple of `SIGNATURE_LENGTH` bytes (no length prefix in
-/// binary formats like postcard). Binary only: human-readable formats
-/// never see the fields, they get the one canonical string of
-/// [`OpaqueDelegation::encode_string`] instead.
-struct SignatureWire([u8; SIGNATURE_LENGTH]);
-
-impl Serialize for SignatureWire {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // A flat tuple of 64 bytes, like v1's SignatureWire: serde has
-        // no built-in impls for arrays over 32, hence the loop and the
-        // visitor below.
-        use serde::ser::SerializeTuple;
-        let mut tup = serializer.serialize_tuple(SIGNATURE_LENGTH)?;
-        for byte in &self.0 {
-            tup.serialize_element(byte)?;
-        }
-        tup.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for SignatureWire {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> serde::de::Visitor<'de> for V {
-            type Value = SignatureWire;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "an ed25519 signature ({SIGNATURE_LENGTH} bytes)")
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut bytes = [0u8; SIGNATURE_LENGTH];
-                for (i, slot) in bytes.iter_mut().enumerate() {
-                    *slot = seq
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
-                }
-                Ok(SignatureWire(bytes))
-            }
-        }
-        deserializer.deserialize_tuple(SIGNATURE_LENGTH, V)
-    }
-}
-
-/// Serde for an ed25519 [`Signature`] via [`SignatureWire`], as a field
-/// attribute.
-mod signature_serde {
-    use ed25519_dalek::Signature;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    use crate::SignatureWire;
-
-    pub fn serialize<S: Serializer>(
-        signature: &Signature,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        SignatureWire(signature.to_bytes()).serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Signature, D::Error> {
-        let SignatureWire(bytes) = SignatureWire::deserialize(deserializer)?;
-        Ok(Signature::from_bytes(&bytes))
-    }
-}
-
-/// The wire layout of [`DelegationData`]: the same variants, plus the
-/// reserved version 0, whose uninhabited payload pins the variant
-/// indices to the version numbers. Lives only at the serde boundary;
-/// everything else works with [`DelegationData`].
-///
-/// Generic over the payload so that serializing borrows the signed
-/// data and deserializing owns it.
-#[derive(Serialize, Deserialize)]
-enum DelegationWire<T> {
-    V0(Never),
-    V1(T),
-    V2(T),
-}
-
-#[derive(Serialize, Deserialize)]
-enum Never {}
-
-impl Serialize for DelegationData {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::V1(signed) => DelegationWire::V1(signed),
-            Self::V2(signed) => DelegationWire::V2(signed),
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for DelegationData {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(match DelegationWire::deserialize(deserializer)? {
-            DelegationWire::V0(never) => match never {},
-            DelegationWire::V1(signed) => Self::V1(signed),
-            DelegationWire::V2(signed) => Self::V2(signed),
-        })
-    }
+/// Decode the lowercase-base32 (no padding) body of a string form.
+fn base32_bytes(s: &str) -> Result<Vec<u8>, DecodeError> {
+    data_encoding::BASE32_NOPAD
+        .decode(s.to_ascii_uppercase().as_bytes())
+        .map_err(DecodeError::malformed)
 }
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::SIGNATURE_LENGTH;
+
     use super::*;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1031,9 +942,10 @@ mod tests {
         assert_eq!(delegation.capability(), &[1]);
         assert!(!delegation.is_v1());
 
-        // For v2, the serde form equals the wire form.
+        // The binary serde form wraps the wire form (encode()) as a
+        // byte string: the wire bytes behind a postcard length prefix.
         let wire = postcard::to_stdvec(&delegation).unwrap();
-        assert_eq!(wire, bytes);
+        assert!(wire.ends_with(&bytes));
         let deserialized: OpaqueDelegation = postcard::from_bytes(&wire).unwrap();
         assert_eq!(deserialized, delegation);
     }
@@ -1134,33 +1046,34 @@ mod tests {
     }
 
     #[test]
-    fn v1_serde_roundtrip_in_top_level_framing() {
+    fn v1_serde_roundtrip_typed() {
         let naked = hex::decode(V1_ROOT_NAKED).unwrap();
-        let delegation = Delegation::<Rpc>::decode(&naked).unwrap().into_opaque();
+        let delegation = Delegation::<Rpc>::decode(&naked).unwrap();
 
-        // The serde form is the top level framing: version discriminator
-        // 1, then the v2 style struct. Not readable as v1 wire bytes,
-        // but needs no capability type to deserialize.
+        // A v1 token needs the capability type to be read back, so it
+        // round-trips through the typed `Delegation<C>`, not the C-free
+        // `OpaqueDelegation`. The binary serde form wraps `encode()` (the
+        // versioned v1 wire form) as a byte string.
         let wire = postcard::to_stdvec(&delegation).unwrap();
-        assert_eq!(wire[0], 1);
-        assert_ne!(wire, naked);
-        let deserialized: OpaqueDelegation = postcard::from_bytes(&wire).unwrap();
+        assert!(wire.ends_with(&delegation.opaque().encode()));
+        let deserialized: Delegation<Rpc> = postcard::from_bytes(&wire).unwrap();
         assert_eq!(deserialized, delegation);
 
-        // After the round trip, the versioned v1 bytes are still exactly
-        // reconstructible.
+        // encode() still reconstructs the exact versioned v1 wire bytes.
         assert_eq!(
-            deserialized.encode(),
+            deserialized.opaque().encode(),
             hex::decode(V1_ROOT_VERSIONED).unwrap()
         );
 
-        // Tampering with the serde form fails signature verification on
-        // deserialize: flip a byte in the capability, which sits right
-        // before the 64 byte signature.
+        // The C-free `OpaqueDelegation` cannot read a v1 token from its
+        // binary serde form: no capability type.
+        assert!(postcard::from_bytes::<OpaqueDelegation>(&wire).is_err());
+
+        // Tampering fails signature verification on deserialize.
         let mut tampered = wire.clone();
         let n = tampered.len();
         tampered[n - 65] ^= 1;
-        assert!(postcard::from_bytes::<OpaqueDelegation>(&tampered).is_err());
+        assert!(postcard::from_bytes::<Delegation<Rpc>>(&tampered).is_err());
     }
 
     #[test]
