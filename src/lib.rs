@@ -346,8 +346,7 @@ impl OpaqueDelegation {
             None => Err(DecodeError::malformed("token is empty")),
             Some(0x01) | Some(0x20) => Err(e!(DecodeError::V1NeedsCapability)),
             _ => {
-                let (wire, leftover) = postcard::take_from_bytes::<DelegationData>(bytes)
-                    .map_err(DecodeError::malformed)?;
+                let (wire, leftover) = take_canonical::<DelegationData>(bytes)?;
                 if !leftover.is_empty() {
                     return Err(DecodeError::malformed(format_args!(
                         "{} trailing bytes",
@@ -542,12 +541,13 @@ impl<C: DeserializeOwned> Delegation<C> {
 impl<C: Serialize + DeserializeOwned> Delegation<C> {
     /// Decode a token of any supported version in the vocabulary `C`.
     ///
-    /// The capability bytes are validated as a canonical `C` encoding
-    /// for every version (v1 needs `C` to parse at all; for v2 the
-    /// check is the conversion from [`OpaqueDelegation`]). Use
-    /// [`into_opaque`](Self::into_opaque) where the untyped
-    /// form is wanted; [`OpaqueDelegation::decode`] decodes v2 tokens without
-    /// a vocabulary.
+    /// The capability bytes must parse as `C`, consumed exactly (v1
+    /// needs `C` to parse at all; for v2 the parse is the conversion
+    /// from [`OpaqueDelegation`]). v2 additionally rejects non-canonical
+    /// framing; v1 is read as leniently as rcan 0.4 wrote it. Use
+    /// [`into_opaque`](Self::into_opaque) where the untyped form is
+    /// wanted; [`OpaqueDelegation::decode`] decodes v2 tokens without a
+    /// vocabulary.
     ///
     /// Version detection: v1 versioned tokens start with `0x01`, naked
     /// v1 serde bytes always start with `0x20` (the length prefix of
@@ -563,6 +563,12 @@ impl<C: Serialize + DeserializeOwned> Delegation<C> {
         Ok(Delegation::new(OpaqueDelegation(DelegationData::V1(
             signed,
         ))))
+    }
+
+    /// Decode the canonical string form. Reads v1 and v2, in the
+    /// vocabulary `C`.
+    pub fn decode_string(s: &str) -> Result<Self, DecodeError> {
+        Self::decode(&base32_bytes(s)?)
     }
 }
 
@@ -623,9 +629,10 @@ impl<'de, C: Serialize + DeserializeOwned> Deserialize<'de> for Delegation<C> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
         if deserializer.is_human_readable() {
-            // The C-free top framing, then the vocabulary check.
-            let opaque = OpaqueDelegation::deserialize(deserializer)?;
-            Self::try_from(opaque).map_err(Error::custom)
+            // The canonical string; the C-typed decode reads v1 as well
+            // as v2.
+            let s = String::deserialize(deserializer)?;
+            Self::decode_string(&s).map_err(Error::custom)
         } else {
             // The binary form wraps the wire bytes; the C-typed decode
             // reads v1 (which needs the capability type) as well as v2.
@@ -637,38 +644,22 @@ impl<'de, C: Serialize + DeserializeOwned> Deserialize<'de> for Delegation<C> {
 
 impl OpaqueDelegation {
     /// Encode into the canonical string form: lowercase base32 (no
-    /// padding) of the postcard serde bytes — the iroh-ticket-style
-    /// encoding, one opaque string instead of a per-field structure.
-    /// This is what serde emits for human-readable formats (JSON, RON,
-    /// TOML, ...).
-    ///
-    /// The encoded bytes are the version-discriminated top framing, not
-    /// the [`Self::encode`] wire form: the framing decodes without a
-    /// capability type in every version.
+    /// padding) of the wire form ([`Self::encode`]) — the iroh-ticket
+    /// style, one opaque string instead of a per-field structure. This
+    /// is what serde emits for human-readable formats (JSON, RON, TOML,
+    /// ...).
     pub fn encode_string(&self) -> String {
-        let bytes = postcard::to_stdvec(&self.0).expect("vec");
-        let mut out = data_encoding::BASE32_NOPAD.encode(&bytes);
+        let mut out = data_encoding::BASE32_NOPAD.encode(&self.encode());
         out.make_ascii_lowercase();
         out
     }
 
     /// Decode the canonical string form of [`Self::encode_string`]. A
-    /// successful decode is signature checked.
+    /// successful decode is signature checked. Like [`Self::decode`],
+    /// v1 tokens are rejected — they need a capability type; use
+    /// [`Delegation::decode_string`].
     pub fn decode_string(s: &str) -> Result<Self, DecodeError> {
-        let bytes = data_encoding::BASE32_NOPAD
-            .decode(s.to_ascii_uppercase().as_bytes())
-            .map_err(DecodeError::malformed)?;
-        let (wire, leftover) =
-            postcard::take_from_bytes::<DelegationData>(&bytes).map_err(DecodeError::malformed)?;
-        if !leftover.is_empty() {
-            return Err(DecodeError::malformed(format_args!(
-                "{} trailing bytes",
-                leftover.len()
-            )));
-        }
-        let out = Self(wire);
-        out.verify()?;
-        Ok(out)
+        Self::decode(&base32_bytes(s)?)
     }
 }
 
@@ -953,6 +944,28 @@ enum DelegationWire<T> {
 
 #[derive(Serialize, Deserialize)]
 enum Never {}
+
+/// Decode the lowercase-base32 (no padding) body of a string form.
+fn base32_bytes(s: &str) -> Result<Vec<u8>, DecodeError> {
+    data_encoding::BASE32_NOPAD
+        .decode(s.to_ascii_uppercase().as_bytes())
+        .map_err(DecodeError::malformed)
+}
+
+/// [`postcard::take_from_bytes`] that rejects non-canonical encodings.
+/// Postcard tolerates non-minimal varints, so parsing alone does not
+/// pin the bytes; this re-encodes the parsed value and requires the
+/// consumed input to equal it. Cheap: the value is small.
+fn take_canonical<T: Serialize + DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, &[u8]), DecodeError> {
+    let (value, rest) = postcard::take_from_bytes::<T>(bytes).map_err(DecodeError::malformed)?;
+    let consumed = &bytes[..bytes.len() - rest.len()];
+    if postcard::to_stdvec(&value).map_err(DecodeError::malformed)? != consumed {
+        return Err(DecodeError::malformed("non-canonical encoding"));
+    }
+    Ok((value, rest))
+}
 
 impl Serialize for DelegationData {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

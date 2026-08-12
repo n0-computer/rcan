@@ -84,6 +84,9 @@ pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(
             leftover.len()
         )));
     }
+    // No canonical check: rcan 0.4 parses v1 through lenient postcard
+    // and does not reject non-minimal varints, so neither do we — a
+    // stricter reader would reject tokens 0.4 minted and accepts.
     wire.into_signed()
 }
 
