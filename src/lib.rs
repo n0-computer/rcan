@@ -563,13 +563,8 @@ impl<C> Serialize for Delegation<C> {
 impl<'de, C: Serialize + DeserializeOwned> Deserialize<'de> for Delegation<C> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-        if deserializer.is_human_readable() {
-            let s = String::deserialize(deserializer)?;
-            Self::decode_string(&s).map_err(Error::custom)
-        } else {
-            let bytes = Vec::<u8>::deserialize(deserializer)?;
-            Self::decode(&bytes).map_err(Error::custom)
-        }
+        let opaque = OpaqueDelegation::deserialize(deserializer)?;
+        Self::try_from(opaque).map_err(D::Error::custom)
     }
 }
 
