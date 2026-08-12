@@ -19,19 +19,20 @@
 //! A naked v1 token is `payload ++ 64 signature bytes`; the versioned
 //! form prefixes `0x01`. The signature covers `DST ++ payload`.
 
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use n0_error::e;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{CapabilityOrigin, DecodeError, Expires, Payload, SignatureWire, Signed};
+use crate::{
+    append_postcard, read_signed, CapabilityOrigin, DecodeError, Expires, Payload, Signed,
+};
 
 /// The v1 domain separation tag.
 pub(crate) const DST: &[u8] = b"rcan-1-delegation";
 
 /// Reconstruct the exact v1 payload bytes from a payload: serdect length
 /// prefixed keys, capability spliced raw, expiry via postcard.
-pub(crate) fn v1_payload_bytes(payload: &Payload) -> Vec<u8> {
-    let mut buf = Vec::new();
+pub(crate) fn v1_payload_bytes(payload: &Payload, buf: &mut Vec<u8>) {
     buf.push(32);
     buf.extend_from_slice(payload.issuer.as_bytes());
     buf.push(32);
@@ -45,59 +46,68 @@ pub(crate) fn v1_payload_bytes(payload: &Payload) -> Vec<u8> {
         }
     }
     buf.extend_from_slice(&payload.capability);
-    postcard::to_extend(&payload.valid_until, buf).expect("vec")
+    append_postcard(&payload.valid_until, buf);
 }
 
-/// Reconstruct the versioned v1 wire bytes, the `Rcan::encode` form of
-/// rcan 0.4.x: `0x01 ++ payload ++ signature`.
-pub(crate) fn v1_encode_versioned(signed: &Signed) -> Vec<u8> {
-    let mut out = vec![1u8];
-    out.extend_from_slice(&v1_payload_bytes(&signed.payload));
-    out.extend_from_slice(&signed.signature.to_bytes());
-    out
-}
-
-/// Verify a v1 signature against the reconstructed signed bytes.
-pub(crate) fn v1_verify(signed: &Signed) -> Result<(), DecodeError> {
-    let mut to_verify = DST.to_vec();
-    to_verify.extend_from_slice(&v1_payload_bytes(&signed.payload));
-    signed
-        .payload
-        .issuer
-        .verify_strict(&to_verify, &signed.signature)
-        .map_err(|_| e!(DecodeError::InvalidSignature))?;
-    Ok(())
-}
-
-/// Parse a naked v1 token (`payload ++ signature`, no version byte) and
-/// verify its signature: postcard deserialization of [`V1Wire`], plus
-/// exact consumption. The capability type is needed to find the end of
-/// the capability field.
-pub(crate) fn v1_parse<C: Serialize + DeserializeOwned>(
+pub(crate) fn parse_and_verify<C: Serialize + DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<Signed, DecodeError> {
-    let (wire, leftover) =
-        postcard::take_from_bytes::<V1Wire<C>>(bytes).map_err(DecodeError::malformed)?;
-    if !leftover.is_empty() {
-        return Err(DecodeError::malformed(format_args!(
-            "{} trailing bytes",
-            leftover.len()
-        )));
-    }
-    // No canonical check: rcan 0.4 parses v1 through lenient postcard
-    // and does not reject non-minimal varints, so neither do we — a
-    // stricter reader would reject tokens 0.4 minted and accepts.
-    wire.into_signed()
+    let (payload, signature) = read_signed::<V1Payload<C>>(bytes)?;
+    let payload: Payload = payload.into();
+    let mut to_verify = DST.to_vec();
+    v1_payload_bytes(&payload, &mut to_verify);
+    payload
+        .issuer
+        .verify_strict(&to_verify, &signature)
+        .map_err(|_| e!(DecodeError::InvalidSignature))?;
+    Ok(Signed { payload, signature })
 }
 
-struct V1VerifyingKey(VerifyingKey);
+#[derive(Deserialize)]
+struct V1Payload<C> {
+    #[serde(with = "prefixed_key_serde")]
+    issuer: VerifyingKey,
+    #[serde(with = "prefixed_key_serde")]
+    audience: VerifyingKey,
+    capability_origin: V1CapabilityOrigin,
+    capability: C,
+    valid_until: Expires,
+}
 
-impl<'de> Deserialize<'de> for V1VerifyingKey {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
+impl<C: Serialize> From<V1Payload<C>> for Payload {
+    fn from(v1: V1Payload<C>) -> Self {
+        Self {
+            issuer: v1.issuer,
+            audience: v1.audience,
+            capability_origin: match v1.capability_origin {
+                V1CapabilityOrigin::Issuer => CapabilityOrigin::Issuer,
+                V1CapabilityOrigin::Delegation(key) => CapabilityOrigin::Delegation(key),
+            },
+            capability: postcard::to_stdvec(&v1.capability).expect("vec"),
+            valid_until: v1.valid_until,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+enum V1CapabilityOrigin {
+    Issuer,
+    Delegation(#[serde(with = "prefixed_key_serde")] VerifyingKey),
+}
+
+/// Deserialize a [`VerifyingKey`] in v1's serdect encoding: length
+/// prefixed bytes. Parse only — v1 bytes are emitted by the byte
+/// recipes above, not through serde.
+mod prefixed_key_serde {
+    use ed25519_dalek::VerifyingKey;
+    use serde::{de::Error, Deserializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<VerifyingKey, D::Error> {
         struct V;
         impl serde::de::Visitor<'_> for V {
-            type Value = V1VerifyingKey;
+            type Value = VerifyingKey;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("32 key bytes")
@@ -107,53 +117,9 @@ impl<'de> Deserialize<'de> for V1VerifyingKey {
                 let bytes: [u8; 32] = v
                     .try_into()
                     .map_err(|_| E::invalid_length(v.len(), &self))?;
-                VerifyingKey::from_bytes(&bytes)
-                    .map(V1VerifyingKey)
-                    .map_err(E::custom)
+                VerifyingKey::from_bytes(&bytes).map_err(E::custom)
             }
         }
         deserializer.deserialize_bytes(V)
-    }
-}
-
-#[derive(Deserialize)]
-struct V1Wire<C>(V1Payload<C>, SignatureWire);
-
-#[derive(Deserialize)]
-struct V1Payload<C> {
-    issuer: V1VerifyingKey,
-    audience: V1VerifyingKey,
-    capability_origin: V1CapabilityOrigin,
-    capability: C,
-    valid_until: Expires,
-}
-
-#[derive(Deserialize)]
-enum V1CapabilityOrigin {
-    Issuer,
-    Delegation(V1VerifyingKey),
-}
-
-impl<C: Serialize + DeserializeOwned> V1Wire<C> {
-    fn into_signed(self) -> Result<Signed, DecodeError> {
-        let Self(payload, signature) = self;
-        let signed = Signed {
-            payload: Payload {
-                issuer: payload.issuer.0,
-                audience: payload.audience.0,
-                capability_origin: match payload.capability_origin {
-                    V1CapabilityOrigin::Issuer => CapabilityOrigin::Issuer,
-                    V1CapabilityOrigin::Delegation(key) => CapabilityOrigin::Delegation(key.0),
-                },
-                valid_until: payload.valid_until,
-                capability: postcard::to_stdvec(&payload.capability)
-                    .map_err(DecodeError::malformed)?,
-            },
-            signature: Signature::from_bytes(&signature.0),
-        };
-        // Verify before yielding, so a deserialized token is always
-        // signature checked.
-        v1_verify(&signed)?;
-        Ok(signed)
     }
 }

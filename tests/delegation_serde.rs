@@ -180,20 +180,12 @@ fn postcard_snapshot_never() {
 }
 
 // Non-canonical v2 encodings: the same token value with a non-minimal
-// varint somewhere. The signature is the valid one over the canonical
-// payload; each is still rejected, because canonicality is a byte check
-// against the re-encoding, not a signature check.
+// varint inside the postcard payload. The signature is the valid one
+// over the canonical payload; each is still rejected, because
+// canonicality is a byte check against the re-encoding, not a signature
+// check. (The version byte is now a raw byte, not a varint, so it has no
+// non-canonical form.)
 
-const V2_NC_VERSION: &str = "
-    82 00                                                            // version: v2 (overlong: 0x82 0x00)
-    3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 // issuer: key(0)
-    8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c // audience: key(1)
-    00                                                               // capability origin: issuer
-    01 80ae99a40f                                                    // valid until: at 4102444800
-    01 01                                                            // capability: 1 byte, Rpc::ReadWrite
-    83461886f14cdfa8b2d60eaab3ce00098761aa2bbf8dd028820fd54211bf2cca // signature (over the canonical form)
-    ccfc635242760b1c1d0d1d1c98943556f725c1e2c7edcd94365660e5af929f06
-";
 const V2_NC_EXPIRY: &str = "
     02                                                               // version: v2
     3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 // issuer: key(0)
@@ -220,7 +212,7 @@ fn v2_rejects_non_canonical() {
     // Sanity: the canonical form decodes, so the vectors below fail on
     // canonicality, not on some unrelated error.
     assert!(OpaqueDelegation::decode(&hexdump(V2_POSTCARD)).is_ok());
-    for nc in [V2_NC_VERSION, V2_NC_EXPIRY, V2_NC_CAP_LEN] {
+    for nc in [V2_NC_EXPIRY, V2_NC_CAP_LEN] {
         let err = OpaqueDelegation::decode(&hexdump(nc)).unwrap_err();
         // Rejected on canonicality specifically, not signature or parse.
         assert!(
