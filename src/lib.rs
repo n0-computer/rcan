@@ -6,13 +6,10 @@
 //! envelope never interprets the capability: typing happens at the
 //! edges, via the [`Capability`] trait.
 //!
-//! The wire format is versioned coarsely by a leading version byte,
-//! which doubles as the discriminator of the internal version enum.
-//! The current version is 2. Version 1 (the `Rcan<C>` of rcan 0.4.x)
-//! can be read via [`Delegation::decode`] and represented losslessly;
-//! writing v1 belongs to rcan 0.4.x itself.
-
-mod v1;
+//! The wire format is versioned coarsely by a leading version byte.
+//! The current, and only supported, version is 2. Version 1 tokens (the
+//! `Rcan<C>` of rcan 0.4.x) are not read by this crate; use rcan 0.4.x
+//! to read them.
 
 use ed25519_dalek::{
     ed25519::signature::Signer, Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH,
@@ -101,11 +98,10 @@ pub enum DecodeError {
         /// What went wrong.
         reason: String,
     },
-    /// v1 wire bytes cannot be decoded without their capability type.
-    ///
-    /// Use [`Delegation::decode`], which has one.
-    #[error("cannot decode a v1 token without its capability type, use Delegation::decode")]
-    V1NeedsCapability,
+    /// The token is a v1 token (rcan 0.4.x), which this crate does not
+    /// support. Read it with the rcan 0.4.x crate instead.
+    #[error("v1 tokens are not supported, use rcan 0.4.x to read them")]
+    UnsupportedV1,
     /// Signature verification failed.
     #[error("signature verification failed")]
     InvalidSignature,
@@ -178,11 +174,6 @@ pub enum InvocationError {
 }
 
 /// The signed content of a delegation.
-///
-/// One struct serves every version: v1 and v2 tokens differ only in
-/// their wire encodings and signature domains, not in their fields. The
-/// serde derive is the v2 wire layout; the v1 layout is produced and
-/// parsed by the v1 compat recipes.
 #[derive(Clone, Serialize, Deserialize, derive_more::Debug, PartialEq, Eq)]
 pub struct Payload {
     /// The issuer
@@ -233,52 +224,30 @@ impl Payload {
     }
 }
 
-/// A payload with its signature. What the signature covers depends on
-/// the version of the containing [`DelegationData`] variant.
+/// A payload with its signature over `DST ++ postcard(payload)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Signed {
     payload: Payload,
     signature: Signature,
 }
 
-/// The versioned in-memory repr of [`OpaqueDelegation`].
-///
-/// Note that the `V1` variant's serde form is the top level framing
-/// (v2 style field encodings), not a v1 wire form — v1 wire bytes can
-/// only be read via [`Delegation::decode`], with a capability type.
-/// The serde form is [`DelegationWire`], which pins the variant
-/// indices to the version numbers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DelegationData {
-    /// A v1 token. Signed over `v1 DST ++ v1 payload layout`.
-    V1(Signed),
-    /// A v2 token. Signed over `DST ++ postcard(payload)`.
-    V2(Signed),
-}
-
 /// A token for attenuated capability delegations.
 ///
-/// Any supported version can be represented.
-///
-/// All envelope fields are accessible without a capability type, for
-/// every version, so verification ([`Authorizer`]) and transport code
-/// can be version agnostic. The capability type is needed in exactly two
-/// places: decoding v1 wire bytes ([`Delegation::decode`]) and evaluating
-/// capabilities during invocation checks.
+/// All envelope fields are accessible without a capability type, so
+/// verification ([`Authorizer`]) and transport code can be capability
+/// agnostic. The capability type is needed only to evaluate capabilities
+/// during invocation checks.
 ///
 /// There are two byte representations:
 ///
-/// - [`Self::encode`] / [`Self::decode`] / [`Delegation::decode`]: the
-///   versioned wire form; for v1 tokens the `Rcan::encode` form of rcan
-///   0.4.x, reconstructed.
-/// - serde: the top level framing, versioned via the enum discriminator
-///   and deserializable without a capability type, but **not** readable
-///   by v1-only code. Human-readable formats (JSON, RON, TOML, ...) get
-///   one opaque string — lowercase base32 of those same framing bytes
+/// - [`Self::encode`] / [`Self::decode`]: the versioned wire form.
+/// - serde: for binary formats, that same wire form behind a length
+///   prefix; for human-readable formats (JSON, RON, TOML, ...) one opaque
+///   string — lowercase base32 of the wire form
 ///   ([`Self::encode_string`]) — instead of a per-field structure.
 ///   Signatures are verified on deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpaqueDelegation(DelegationData);
+pub struct OpaqueDelegation(Signed);
 
 pub struct DelegationBuilder<'s, C> {
     issuer: &'s SigningKey,
@@ -345,18 +314,18 @@ impl OpaqueDelegation {
             .issuer
             .verify_strict(&to_verify, &signature)
             .map_err(|_| e!(DecodeError::InvalidSignature))?;
-        Ok(Self(DelegationData::V2(Signed { payload, signature })))
+        Ok(Self(Signed { payload, signature }))
     }
 
-    /// Decode a token of version >= 2. A successful decode is signature
-    /// checked, and the input must be consumed exactly.
+    /// Decode a v2 token. A successful decode is signature checked, and
+    /// the input must be consumed exactly.
     ///
-    /// v1 tokens are rejected: deserializing them requires the
-    /// capability type, use [`Delegation::decode`].
+    /// v1 tokens ([`DecodeError::UnsupportedV1`]) are rejected; read them
+    /// with rcan 0.4.x.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         match bytes.split_first() {
             None => Err(DecodeError::malformed("token is empty")),
-            Some((0x01, _)) | Some((0x20, _)) => Err(e!(DecodeError::V1NeedsCapability)),
+            Some((0x01, _)) | Some((0x20, _)) => Err(e!(DecodeError::UnsupportedV1)),
             Some((0x02, bytes)) => Self::decode_v2(bytes),
             Some((v, _)) => Err(DecodeError::malformed(format!(
                 "unknown version byte {:#x}",
@@ -365,34 +334,17 @@ impl OpaqueDelegation {
         }
     }
 
-    /// Encode in the versioned wire form. For v1 tokens this is the
-    /// `Rcan::encode` form of rcan 0.4.x, reconstructed.
+    /// Encode in the versioned wire form.
     pub fn encode(&self) -> Vec<u8> {
         let mut res = Vec::new();
-        match &self.0 {
-            DelegationData::V1(signed) => {
-                res.push(1u8);
-                v1::v1_payload_bytes(&signed.payload, &mut res);
-                res.extend_from_slice(&signed.signature.to_bytes());
-            }
-            DelegationData::V2(signed) => {
-                res.push(2u8);
-                append_postcard(&signed.payload, &mut res);
-                res.extend_from_slice(&signed.signature.to_bytes());
-            }
-        }
+        res.push(2u8);
+        append_postcard(&self.0.payload, &mut res);
+        res.extend_from_slice(&self.0.signature.to_bytes());
         res
     }
 
     pub(crate) fn signed(&self) -> &Signed {
-        match &self.0 {
-            DelegationData::V1(signed) | DelegationData::V2(signed) => signed,
-        }
-    }
-
-    /// Whether this is a v1 token.
-    pub fn is_v1(&self) -> bool {
-        matches!(self.0, DelegationData::V1(_))
+        &self.0
     }
 
     pub fn payload(&self) -> &Payload {
@@ -445,7 +397,7 @@ impl<C> DelegationBuilder<'_, C> {
         };
         let to_sign = postcard::to_extend(&payload, DST.to_vec()).expect("vec");
         let signature = self.issuer.sign(&to_sign);
-        Delegation::v2(Signed { payload, signature })
+        Delegation::new(OpaqueDelegation(Signed { payload, signature }))
     }
 }
 
@@ -481,14 +433,6 @@ impl<C> Delegation<C> {
             opaque,
             _marker: std::marker::PhantomData,
         }
-    }
-
-    fn v1(signed: Signed) -> Self {
-        Self::new(OpaqueDelegation(DelegationData::V1(signed)))
-    }
-
-    fn v2(signed: Signed) -> Self {
-        Self::new(OpaqueDelegation(DelegationData::V2(signed)))
     }
 
     pub fn opaque(&self) -> &OpaqueDelegation {
@@ -535,11 +479,6 @@ impl<C> Delegation<C> {
     pub fn encode(&self) -> Vec<u8> {
         self.opaque.encode()
     }
-
-    /// Whether this is a v1 token.
-    pub fn is_v1(&self) -> bool {
-        self.opaque.is_v1()
-    }
 }
 
 impl<C: Serialize + DeserializeOwned> Delegation<C> {
@@ -549,39 +488,20 @@ impl<C: Serialize + DeserializeOwned> Delegation<C> {
         postcard::from_bytes(self.opaque.capability()).expect("invariant: capability parses as C")
     }
 
-    /// Decode a token of any supported version in the vocabulary `C`.
+    /// Decode a v2 token in the vocabulary `C`.
     ///
-    /// The capability bytes must parse as `C`, consumed exactly (v1
-    /// needs `C` to parse at all; for v2 the parse is the conversion
-    /// from [`OpaqueDelegation`]). v2 additionally rejects non-canonical
-    /// framing; v1 is read as leniently as rcan 0.4 wrote it. Use
+    /// The capability bytes must parse as `C`, consumed exactly, and the
+    /// framing must be canonical. Use
     /// [`into_opaque`](Self::into_opaque) where the untyped form is
-    /// wanted; [`OpaqueDelegation::decode`] decodes v2 tokens without a
-    /// vocabulary.
-    ///
-    /// Version detection: v1 versioned tokens start with `0x01`, naked
-    /// v1 serde bytes always start with `0x20` (the length prefix of
-    /// the issuer key), and v2 wire tokens start with `0x02`. Version
-    /// 32 must never be assigned, it would collide with naked v1.
+    /// wanted; [`OpaqueDelegation::decode`] decodes without a vocabulary.
+    /// v1 tokens are rejected ([`DecodeError::UnsupportedV1`]); read them
+    /// with rcan 0.4.x.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        match bytes.split_first() {
-            None => Err(DecodeError::malformed("token is empty")),
-            Some((0x01, rest)) => Ok(Delegation::v1(v1::parse_and_verify::<C>(rest)?)),
-            Some((0x20, _)) => Ok(Delegation::v1(v1::parse_and_verify::<C>(bytes)?)),
-            Some((0x02, _)) => {
-                let delegation = OpaqueDelegation::decode(bytes)?;
-                let delegation = Delegation::<C>::try_from(delegation)?;
-                Ok(delegation)
-            }
-            Some((v, _)) => Err(DecodeError::malformed(format!(
-                "unknown version byte {:#x}",
-                v
-            ))),
-        }
+        let delegation = OpaqueDelegation::decode(bytes)?;
+        Delegation::<C>::try_from(delegation)
     }
 
-    /// Decode the canonical string form. Reads v1 and v2, in the
-    /// vocabulary `C`.
+    /// Decode the canonical string form, in the vocabulary `C`.
     pub fn decode_string(s: &str) -> Result<Self, DecodeError> {
         Self::decode(&base32_bytes(s)?)
     }
@@ -666,9 +586,8 @@ impl OpaqueDelegation {
     }
 
     /// Decode the canonical string form of [`Self::encode_string`]. A
-    /// successful decode is signature checked. Like [`Self::decode`],
-    /// v1 tokens are rejected — they need a capability type; use
-    /// [`Delegation::decode_string`].
+    /// successful decode is signature checked. Like [`Self::decode`], v1
+    /// tokens are rejected; read them with rcan 0.4.x.
     pub fn decode_string(s: &str) -> Result<Self, DecodeError> {
         Self::decode(&base32_bytes(s)?)
     }
@@ -906,18 +825,6 @@ mod tests {
         SigningKey::from_bytes(&[byte; 32])
     }
 
-    /// Pinned v1 wire vectors, generated with the real rcan 0.4.x
-    /// implementation (keys [0; 32], [1; 32], [2; 32]):
-    ///
-    /// - root: issuing_builder(service, alice, Rpc::All)
-    ///   .sign(Expires::At(4_102_444_800))
-    /// - link: delegating_builder(alice, bob, service, Rpc::Read)
-    ///   .sign(Expires::Never)
-    pub(crate) const V1_ROOT_VERSIONED: &str = "01203b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00020180ae99a40f7e0b2024caf7fd65d38fa6007664ba45ac3714dbd0055ae7970d6601cbbec0440d3293fbffe56d9eaa7deddf61e92f8fb7d1272fdbac902a1db5fe9cf6998b04";
-    pub(crate) const V1_ROOT_NAKED: &str = "203b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00020180ae99a40f7e0b2024caf7fd65d38fa6007664ba45ac3714dbd0055ae7970d6601cbbec0440d3293fbffe56d9eaa7deddf61e92f8fb7d1272fdbac902a1db5fe9cf6998b04";
-    pub(crate) const V1_LINK_VERSIONED: &str = "01208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39401203b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da2900001e623cd399360cb4fdb00e829430d53b5db30ed3d3149d1c59305f22f89d41fe3d866c5d48943d85ed2c7cb1b289d7d2edbef8b2b8f81c61eb74759600909a0a";
-    pub(crate) const V1_LINK_NAKED: &str = "208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39401203b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da2900001e623cd399360cb4fdb00e829430d53b5db30ed3d3149d1c59305f22f89d41fe3d866c5d48943d85ed2c7cb1b289d7d2edbef8b2b8f81c61eb74759600909a0a";
-
     #[test]
     fn v2_roundtrip() {
         let issuer = key(0);
@@ -940,7 +847,6 @@ mod tests {
         assert_eq!(delegation.expires(), &Expires::Never);
         assert_eq!(delegation.capability_issuer(), &issuer.verifying_key());
         assert_eq!(delegation.capability(), &[1]);
-        assert!(!delegation.is_v1());
 
         // The binary serde form wraps the wire form (encode()) as a
         // byte string: the wire bytes behind a postcard length prefix.
@@ -991,104 +897,18 @@ mod tests {
     }
 
     #[test]
-    fn v1_decode_matches_pinned_vectors() {
+    fn two_link_chain_invocation() {
         let service = key(0);
         let alice = key(1);
         let bob = key(2);
 
-        for (versioned_hex, naked_hex) in [
-            (V1_ROOT_VERSIONED, V1_ROOT_NAKED),
-            (V1_LINK_VERSIONED, V1_LINK_NAKED),
-        ] {
-            let versioned = hex::decode(versioned_hex).unwrap();
-            let naked = hex::decode(naked_hex).unwrap();
+        // The service grants alice everything, expiring at a fixed time...
+        let root: OpaqueDelegation =
+            Delegation::issuing_builder(&service, alice.verifying_key(), &Rpc::All)
+                .sign(Expires::At(4_102_444_800))
+                .into();
 
-            // Both wire forms decode, to equal values.
-            let delegation = Delegation::<Rpc>::decode(&versioned).unwrap().into_opaque();
-            let from_naked = Delegation::<Rpc>::decode(&naked).unwrap().into_opaque();
-            assert_eq!(delegation, from_naked);
-            assert!(delegation.is_v1());
-
-            // encode always emits the versioned form, byte exact.
-            assert_eq!(delegation.encode(), versioned);
-
-            // decode without C rejects v1.
-            assert!(OpaqueDelegation::decode(&versioned).is_err());
-            assert!(OpaqueDelegation::decode(&naked).is_err());
-        }
-
-        // Envelope accessors, C free.
-        let root = Delegation::<Rpc>::decode(&hex::decode(V1_ROOT_VERSIONED).unwrap())
-            .unwrap()
-            .into_opaque();
-        assert_eq!(root.issuer(), &service.verifying_key());
-        assert_eq!(root.audience(), &alice.verifying_key());
-        assert_eq!(root.capability_issuer(), &service.verifying_key());
-        assert_eq!(root.expires(), &Expires::At(4_102_444_800));
-        assert_eq!(root.capability(), &[2]); // Rpc::All
-
-        let link = Delegation::<Rpc>::decode(&hex::decode(V1_LINK_VERSIONED).unwrap())
-            .unwrap()
-            .into_opaque();
-        assert_eq!(link.issuer(), &alice.verifying_key());
-        assert_eq!(link.audience(), &bob.verifying_key());
-        assert_eq!(link.capability_issuer(), &service.verifying_key());
-        assert_eq!(link.expires(), &Expires::Never);
-        assert_eq!(link.capability(), &[0]); // Rpc::Read
-
-        // A tampered v1 token fails signature verification: flip the
-        // capability byte (Rpc::All -> Rpc::Read keeps the length).
-        let mut tampered = hex::decode(V1_ROOT_VERSIONED).unwrap();
-        let capability_offset = 1 + 33 + 33 + 1;
-        assert_eq!(tampered[capability_offset], 2);
-        tampered[capability_offset] = 0;
-        assert!(Delegation::<Rpc>::decode(&tampered).is_err());
-    }
-
-    #[test]
-    fn v1_serde_roundtrip_typed() {
-        let naked = hex::decode(V1_ROOT_NAKED).unwrap();
-        let delegation = Delegation::<Rpc>::decode(&naked).unwrap();
-
-        // A v1 token needs the capability type to be read back, so it
-        // round-trips through the typed `Delegation<C>`, not the C-free
-        // `OpaqueDelegation`. The binary serde form wraps `encode()` (the
-        // versioned v1 wire form) as a byte string.
-        let wire = postcard::to_stdvec(&delegation).unwrap();
-        assert!(wire.ends_with(&delegation.opaque().encode()));
-        let deserialized: Delegation<Rpc> = postcard::from_bytes(&wire).unwrap();
-        assert_eq!(deserialized, delegation);
-
-        // encode() still reconstructs the exact versioned v1 wire bytes.
-        assert_eq!(
-            deserialized.opaque().encode(),
-            hex::decode(V1_ROOT_VERSIONED).unwrap()
-        );
-
-        // The C-free `OpaqueDelegation` cannot read a v1 token from its
-        // binary serde form: no capability type.
-        assert!(postcard::from_bytes::<OpaqueDelegation>(&wire).is_err());
-
-        // Tampering fails signature verification on deserialize.
-        let mut tampered = wire.clone();
-        let n = tampered.len();
-        tampered[n - 65] ^= 1;
-        assert!(postcard::from_bytes::<Delegation<Rpc>>(&tampered).is_err());
-    }
-
-    #[test]
-    fn mixed_chain_invocation() {
-        let service = key(0);
-        let alice = key(1);
-        let bob = key(2);
-
-        // The root grant is a legacy v1 token (pinned vector: service
-        // grants alice everything)...
-        let root = Delegation::<Rpc>::decode(&hex::decode(V1_ROOT_VERSIONED).unwrap())
-            .unwrap()
-            .into_opaque();
-
-        // ...and alice delegates onward with v2.
+        // ...and alice delegates Read onward to bob.
         let link: OpaqueDelegation = Delegation::delegating_builder(
             &alice,
             bob.verifying_key(),
@@ -1210,11 +1030,6 @@ mod tests {
         assert!(authorizer
             .check_invocation_from(bob.verifying_key(), Rpc::ReadWrite, &[&root, &typed_link])
             .is_err());
-
-        // A typed v1 token works the same way: type safety is
-        // orthogonal to version.
-        let typed_v1 = Delegation::<Rpc>::decode(&hex::decode(V1_ROOT_VERSIONED).unwrap()).unwrap();
-        assert_eq!(typed_v1.capability(), Rpc::All);
     }
 
     #[test]

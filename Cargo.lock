@@ -12,12 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "atomic-polyfill"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -640,21 +634,6 @@ dependencies = [
 
 [[package]]
 name = "rcan"
-version = "0.4.0"
-source = "git+https://github.com/n0-computer/rcan?rev=4f3ec3569ce3cf794ddacd9648db97567ace629e#4f3ec3569ce3cf794ddacd9648db97567ace629e"
-dependencies = [
- "anyhow",
- "derive_more",
- "ed25519-dalek",
- "hex",
- "n0-future",
- "postcard",
- "serde",
- "serdect",
-]
-
-[[package]]
-name = "rcan"
 version = "0.5.0"
 dependencies = [
  "ciborium",
@@ -665,7 +644,6 @@ dependencies = [
  "n0-error",
  "n0-future",
  "postcard",
- "rcan 0.4.0",
  "ron",
  "serde",
  "serde_json",
