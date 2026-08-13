@@ -121,7 +121,10 @@ fn serde_delegates_to_encode() {
     assert_eq!(wire, postcard::to_stdvec(&v2.encode()).unwrap());
     assert_eq!(postcard::from_bytes::<OpaqueDelegation>(&wire).unwrap(), v2);
     assert_eq!(postcard::to_stdvec(&typed).unwrap(), wire);
-    assert_eq!(postcard::from_bytes::<Delegation<Rpc>>(&wire).unwrap(), typed);
+    assert_eq!(
+        postcard::from_bytes::<Delegation<Rpc>>(&wire).unwrap(),
+        typed
+    );
 
     let mut cbor = Vec::new();
     ciborium::into_writer(&v2, &mut cbor).unwrap();
@@ -139,7 +142,10 @@ fn serde_delegates_to_encode() {
         serde_json::from_str::<OpaqueDelegation>(&quoted).unwrap(),
         v2
     );
-    assert_eq!(serde_json::from_str::<Delegation<Rpc>>(&quoted).unwrap(), typed);
+    assert_eq!(
+        serde_json::from_str::<Delegation<Rpc>>(&quoted).unwrap(),
+        typed
+    );
     assert_eq!(ron::to_string(&v2).unwrap(), quoted);
     assert_eq!(ron::from_str::<OpaqueDelegation>(&quoted).unwrap(), v2);
 }
@@ -148,10 +154,9 @@ fn serde_delegates_to_encode() {
 fn v2_decode_rejects_tampering() {
     let issuer = key(0);
     let audience = key(1).verifying_key();
-    let delegation: OpaqueDelegation =
-        Delegation::issuing_builder(&issuer, audience, &Rpc::Read)
-            .sign(Expires::Never)
-            .into();
+    let delegation: OpaqueDelegation = Delegation::issuing_builder(&issuer, audience, &Rpc::Read)
+        .sign(Expires::Never)
+        .into();
     let good = delegation.encode();
 
     let mut forged = good.clone();
