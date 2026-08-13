@@ -1,8 +1,3 @@
-//! Serde-form tests for delegations. The binary serde form wraps the
-//! wire form (`encode()`) as an opaque byte string; human-readable
-//! formats use the canonical base32 string. These pin the v2 wire form
-//! and the canonical strings, and check the round trips.
-
 use ed25519_dalek::SigningKey;
 use rcan::{Delegation, Expires, OpaqueDelegation};
 use serde::{Deserialize, Serialize};
@@ -18,17 +13,12 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
-/// A deterministic v2 token: service ([0; 32]) grants alice ([1; 32])
-/// ReadWrite until 4_102_444_800.
 fn v2_token() -> OpaqueDelegation {
     Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::ReadWrite)
         .sign(Expires::At(4_102_444_800))
         .into()
 }
 
-/// Parse an annotated hex dump: `//` starts a comment until end of
-/// line, whitespace is ignored. The syntax of hex-literal before 0.4
-/// dropped comment support.
 fn hexdump(s: &str) -> Vec<u8> {
     let hex: String = s
         .lines()
@@ -54,14 +44,11 @@ const V2_STRING: &str = "ai5wuj54z23killcuounaktpbvzwkmqvo4o6eq5ghlaerimllhnctcu
 
 #[test]
 fn postcard_snapshots() {
-    // encode() is the wire form; the binary serde form wraps it behind
-    // a postcard length prefix. The v2 wire form is pinned byte-exact.
     assert_eq!(
         hex::encode(v2_token().encode()),
         hex::encode(hexdump(V2_POSTCARD))
     );
 
-    // v2 round-trips through OpaqueDelegation.
     let v2 = v2_token();
     let serde = postcard::to_stdvec(&v2).unwrap();
     assert!(serde.ends_with(&v2.encode()));
@@ -73,8 +60,6 @@ fn postcard_snapshots() {
 
 #[test]
 fn cbor_roundtrip() {
-    // The binary serde form is opaque bytes, so CBOR carries no
-    // structure worth pinning; check the round trip in both type layers.
     let v2 = v2_token();
     let mut bytes = Vec::new();
     ciborium::into_writer(&v2, &mut bytes).unwrap();
@@ -94,7 +79,6 @@ fn cbor_roundtrip() {
 
 #[test]
 fn string_snapshots() {
-    // v2 round-trips through the C-free OpaqueDelegation.
     let v2 = v2_token();
     assert_eq!(v2.encode_string(), V2_STRING);
     assert_eq!(OpaqueDelegation::decode_string(V2_STRING).unwrap(), v2);
@@ -107,11 +91,9 @@ fn string_snapshots() {
     assert_eq!(ron::to_string(&v2).unwrap(), quoted);
     assert_eq!(ron::from_str::<OpaqueDelegation>(&quoted).unwrap(), v2);
 
-    // The typed layer reads the same string, validating the vocabulary.
     let typed = Delegation::<Rpc>::decode_string(V2_STRING).unwrap();
     assert_eq!(typed.opaque(), &v2);
 
-    // Tampering with the string fails on decode.
     let mut bytes = data_encoding::BASE32_NOPAD
         .decode(V2_STRING.to_ascii_uppercase().as_bytes())
         .unwrap();
@@ -122,8 +104,6 @@ fn string_snapshots() {
     assert!(OpaqueDelegation::decode_string(&tampered).is_err());
 }
 
-/// The other payload shapes: a token that never expires. `Never` is a
-/// single byte, so the whole valid-until field shrinks to one tag.
 #[test]
 fn postcard_snapshot_never() {
     const PINNED: &str = "
@@ -140,7 +120,6 @@ fn postcard_snapshot_never() {
         Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
             .sign(Expires::Never)
             .into();
-    // PINNED is encode() (the wire form); the serde form wraps it.
     assert_eq!(hex::encode(token.encode()), hex::encode(hexdump(PINNED)));
     let serde = postcard::to_stdvec(&token).unwrap();
     assert!(serde.ends_with(&token.encode()));
@@ -149,13 +128,6 @@ fn postcard_snapshot_never() {
         token
     );
 }
-
-// Non-canonical v2 encodings: the same token value with a non-minimal
-// varint inside the postcard payload. The signature is the valid one
-// over the canonical payload; each is still rejected, because
-// canonicality is a byte check against the re-encoding, not a signature
-// check. (The version byte is a raw byte, not a varint, so it has no
-// non-canonical form.)
 
 const V2_NC_EXPIRY: &str = "
     02                                                               // version: v2
@@ -180,12 +152,9 @@ const V2_NC_CAP_LEN: &str = "
 
 #[test]
 fn v2_rejects_non_canonical() {
-    // Sanity: the canonical form decodes, so the vectors below fail on
-    // canonicality, not on some unrelated error.
     assert!(OpaqueDelegation::decode(&hexdump(V2_POSTCARD)).is_ok());
     for nc in [V2_NC_EXPIRY, V2_NC_CAP_LEN] {
         let err = OpaqueDelegation::decode(&hexdump(nc)).unwrap_err();
-        // Rejected on canonicality specifically, not signature or parse.
         assert!(
             err.to_string().contains("canonical"),
             "expected a non-canonical error, got: {err}"
@@ -195,8 +164,6 @@ fn v2_rejects_non_canonical() {
 
 #[test]
 fn rejects_v1() {
-    // A v1 versioned token (leading 0x01) and a naked v1 serde token
-    // (leading 0x20) are both refused, without a capability type or with.
     for lead in [0x01u8, 0x20u8] {
         let bytes = [lead; 8];
         let err = OpaqueDelegation::decode(&bytes).unwrap_err();
