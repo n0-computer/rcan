@@ -7,7 +7,7 @@ use crate::{
     Authorizer, Capability, DecodeError, Delegation, Expires, InvocationError, OpaqueDelegation,
 };
 
-/// An example capability vocabulary for testing.
+/// An example capability type for testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Rpc {
     Read,
@@ -78,7 +78,10 @@ fn wire_snapshots() {
     let bytes = v2.encode();
     assert_eq!(bytes[0], 2);
     assert_eq!(hex::encode(&bytes), hex::encode(hexdump(V2_POSTCARD)));
-    assert_eq!(Delegation::<Rpc>::decode(&hexdump(V2_POSTCARD)).unwrap(), v2);
+    assert_eq!(
+        Delegation::<Rpc>::decode(&hexdump(V2_POSTCARD)).unwrap(),
+        v2
+    );
 
     assert_eq!(v2.issuer(), &key(0).verifying_key());
     assert_eq!(v2.audience(), &key(1).verifying_key());
@@ -89,7 +92,10 @@ fn wire_snapshots() {
     let never = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
         .sign(Expires::Never);
     assert_eq!(hex::encode(never.encode()), hex::encode(hexdump(V2_NEVER)));
-    assert_eq!(Delegation::<Rpc>::decode(&hexdump(V2_NEVER)).unwrap(), never);
+    assert_eq!(
+        Delegation::<Rpc>::decode(&hexdump(V2_NEVER)).unwrap(),
+        never
+    );
 
     let opaque = OpaqueDelegation::decode(&bytes).unwrap();
     assert_eq!(&opaque, v2.opaque());
@@ -140,7 +146,10 @@ fn serde_delegates_to_encode() {
 
     let quoted = serde_json::to_string(&v2.encode_string()).unwrap();
     assert_eq!(serde_json::to_string(&v2).unwrap(), quoted);
-    assert_eq!(serde_json::from_str::<Delegation<Rpc>>(&quoted).unwrap(), v2);
+    assert_eq!(
+        serde_json::from_str::<Delegation<Rpc>>(&quoted).unwrap(),
+        v2
+    );
     assert_eq!(ron::to_string(&v2).unwrap(), quoted);
     assert_eq!(ron::from_str::<Delegation<Rpc>>(&quoted).unwrap(), v2);
 }
@@ -238,22 +247,22 @@ fn opaque_roundtrip() {
 }
 
 #[test]
-fn foreign_vocabulary_rejected() {
+fn rejects_wrong_capability_type() {
     #[derive(Debug, Serialize, Deserialize)]
-    struct OtherVocabulary {
+    struct OtherCapability {
         topic: String,
         write: bool,
     }
 
     let typed = delegation();
     let untyped: OpaqueDelegation = typed.clone().into();
-    let err = Delegation::<OtherVocabulary>::try_from(untyped).unwrap_err();
-    assert_matches!(err, DecodeError::ForeignVocabulary { .. });
-    let err = Delegation::<OtherVocabulary>::decode(&typed.encode()).unwrap_err();
-    assert_matches!(err, DecodeError::ForeignVocabulary { .. });
+    let err = Delegation::<OtherCapability>::try_from(untyped).unwrap_err();
+    assert_matches!(err, DecodeError::WrongCapability { .. });
+    let err = Delegation::<OtherCapability>::decode(&typed.encode()).unwrap_err();
+    assert_matches!(err, DecodeError::WrongCapability { .. });
 
     let wire = postcard::to_stdvec(&typed).unwrap();
-    assert!(postcard::from_bytes::<Delegation<OtherVocabulary>>(&wire).is_err());
+    assert!(postcard::from_bytes::<Delegation<OtherCapability>>(&wire).is_err());
 }
 
 #[test]

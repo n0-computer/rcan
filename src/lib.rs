@@ -389,7 +389,7 @@ impl<C: Serialize + DeserializeOwned> TryFrom<OpaqueDelegation> for Delegation<C
     fn try_from(delegation: OpaqueDelegation) -> Result<Self, DecodeError> {
         match postcard::take_from_bytes::<C>(delegation.capability()) {
             Ok((_, [])) => Ok(Self::new(delegation)),
-            _ => Err(e!(DecodeError::ForeignVocabulary)),
+            _ => Err(e!(DecodeError::WrongCapability)),
         }
     }
 }
@@ -610,9 +610,9 @@ pub enum DecodeError {
     /// The signature on the token is invalid.
     #[error("signature verification failed")]
     InvalidSignature,
-    /// The capability in the token does not parse in the expected vocabulary.
-    #[error("capability does not parse in the vocabulary")]
-    ForeignVocabulary,
+    /// The capability in the token does not parse as the expected capability type.
+    #[error("capability does not parse as the expected capability type")]
+    WrongCapability,
 }
 
 impl DecodeError {
