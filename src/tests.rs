@@ -1,9 +1,13 @@
+use assert_matches::assert_matches;
 use ed25519_dalek::{SigningKey, SIGNATURE_LENGTH};
 use n0_future::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
-use crate::{Authorizer, Capability, Delegation, Expires, OpaqueDelegation};
+use crate::{
+    Authorizer, Capability, DecodeError, Delegation, Expires, InvocationError, OpaqueDelegation,
+};
 
+/// An example capability vocabulary for testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Rpc {
     Read,
@@ -11,6 +15,7 @@ enum Rpc {
     All,
 }
 
+/// A simple capability model for testing: All > ReadWrite > Read.
 impl Capability for Rpc {
     fn permits(&self, other: &Self) -> bool {
         match (self, other) {
@@ -23,14 +28,14 @@ impl Capability for Rpc {
     }
 }
 
+/// Returns a signing key derived from the given seed byte.
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
-fn v2_token() -> OpaqueDelegation {
+fn delegation() -> Delegation<Rpc> {
     Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::ReadWrite)
         .sign(Expires::At(4_102_444_800))
-        .into()
 }
 
 fn hexdump(s: &str) -> Vec<u8> {
@@ -69,38 +74,35 @@ const V2_STRING: &str = "ai5wuj54z23killcuounaktpbvzwkmqvo4o6eq5ghlaerimllhnctcu
 
 #[test]
 fn wire_snapshots() {
-    let v2 = v2_token();
+    let v2 = delegation();
     let bytes = v2.encode();
     assert_eq!(bytes[0], 2);
     assert_eq!(hex::encode(&bytes), hex::encode(hexdump(V2_POSTCARD)));
-    assert_eq!(OpaqueDelegation::decode(&hexdump(V2_POSTCARD)).unwrap(), v2);
+    assert_eq!(Delegation::<Rpc>::decode(&hexdump(V2_POSTCARD)).unwrap(), v2);
 
     assert_eq!(v2.issuer(), &key(0).verifying_key());
     assert_eq!(v2.audience(), &key(1).verifying_key());
     assert_eq!(v2.expires(), &Expires::At(4_102_444_800));
     assert_eq!(v2.capability_issuer(), &key(0).verifying_key());
-    assert_eq!(v2.capability(), &[1]);
+    assert_eq!(v2.capability(), Rpc::ReadWrite);
 
-    let never: OpaqueDelegation =
-        Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
-            .sign(Expires::Never)
-            .into();
+    let never = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
+        .sign(Expires::Never);
     assert_eq!(hex::encode(never.encode()), hex::encode(hexdump(V2_NEVER)));
-    assert_eq!(OpaqueDelegation::decode(&hexdump(V2_NEVER)).unwrap(), never);
+    assert_eq!(Delegation::<Rpc>::decode(&hexdump(V2_NEVER)).unwrap(), never);
 
-    let typed = Delegation::<Rpc>::decode(&v2.encode()).unwrap();
-    assert_eq!(typed.encode(), v2.encode());
-    assert_eq!(typed.opaque(), &v2);
+    let opaque = OpaqueDelegation::decode(&bytes).unwrap();
+    assert_eq!(&opaque, v2.opaque());
 }
 
 #[test]
 fn string_snapshots() {
-    let v2 = v2_token();
+    let v2 = delegation();
     assert_eq!(v2.encode_string(), V2_STRING);
-    assert_eq!(OpaqueDelegation::decode_string(V2_STRING).unwrap(), v2);
+    assert_eq!(Delegation::<Rpc>::decode_string(V2_STRING).unwrap(), v2);
 
-    let typed = Delegation::<Rpc>::decode_string(V2_STRING).unwrap();
-    assert_eq!(typed.opaque(), &v2);
+    let opaque = OpaqueDelegation::decode_string(V2_STRING).unwrap();
+    assert_eq!(&opaque, v2.opaque());
 
     let mut bytes = data_encoding::BASE32_NOPAD
         .decode(V2_STRING.to_ascii_uppercase().as_bytes())
@@ -109,21 +111,21 @@ fn string_snapshots() {
     bytes[n - 1] ^= 1;
     let mut tampered = data_encoding::BASE32_NOPAD.encode(&bytes);
     tampered.make_ascii_lowercase();
-    assert!(OpaqueDelegation::decode_string(&tampered).is_err());
+    let err = Delegation::<Rpc>::decode_string(&tampered).unwrap_err();
+    assert_matches!(err, DecodeError::InvalidSignature { .. });
 }
 
 #[test]
 fn serde_delegates_to_encode() {
-    let v2 = v2_token();
-    let typed = Delegation::<Rpc>::decode(&v2.encode()).unwrap();
+    let v2 = delegation();
 
     let wire = postcard::to_stdvec(&v2).unwrap();
     assert_eq!(wire, postcard::to_stdvec(&v2.encode()).unwrap());
-    assert_eq!(postcard::from_bytes::<OpaqueDelegation>(&wire).unwrap(), v2);
-    assert_eq!(postcard::to_stdvec(&typed).unwrap(), wire);
+    assert_eq!(postcard::from_bytes::<Delegation<Rpc>>(&wire).unwrap(), v2);
+    assert_eq!(postcard::to_stdvec(v2.opaque()).unwrap(), wire);
     assert_eq!(
-        postcard::from_bytes::<Delegation<Rpc>>(&wire).unwrap(),
-        typed
+        postcard::from_bytes::<OpaqueDelegation>(&wire).unwrap(),
+        *v2.opaque()
     );
 
     let mut cbor = Vec::new();
@@ -132,57 +134,53 @@ fn serde_delegates_to_encode() {
     ciborium::into_writer(&v2.encode(), &mut expected).unwrap();
     assert_eq!(cbor, expected);
     assert_eq!(
-        ciborium::from_reader::<OpaqueDelegation, _>(&cbor[..]).unwrap(),
+        ciborium::from_reader::<Delegation<Rpc>, _>(&cbor[..]).unwrap(),
         v2
     );
 
     let quoted = serde_json::to_string(&v2.encode_string()).unwrap();
     assert_eq!(serde_json::to_string(&v2).unwrap(), quoted);
-    assert_eq!(
-        serde_json::from_str::<OpaqueDelegation>(&quoted).unwrap(),
-        v2
-    );
-    assert_eq!(
-        serde_json::from_str::<Delegation<Rpc>>(&quoted).unwrap(),
-        typed
-    );
+    assert_eq!(serde_json::from_str::<Delegation<Rpc>>(&quoted).unwrap(), v2);
     assert_eq!(ron::to_string(&v2).unwrap(), quoted);
-    assert_eq!(ron::from_str::<OpaqueDelegation>(&quoted).unwrap(), v2);
+    assert_eq!(ron::from_str::<Delegation<Rpc>>(&quoted).unwrap(), v2);
 }
 
 #[test]
 fn v2_decode_rejects_tampering() {
-    let issuer = key(0);
-    let audience = key(1).verifying_key();
-    let delegation: OpaqueDelegation = Delegation::issuing_builder(&issuer, audience, &Rpc::Read)
+    let good = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::Read)
         .sign(Expires::Never)
-        .into();
-    let good = delegation.encode();
+        .encode();
 
     let mut forged = good.clone();
     let n = forged.len();
     forged[n - SIGNATURE_LENGTH..].fill(0);
-    assert!(OpaqueDelegation::decode(&forged).is_err());
+    let err = Delegation::<Rpc>::decode(&forged).unwrap_err();
+    assert_matches!(err, DecodeError::InvalidSignature { .. });
 
     let mut widened = good.clone();
     let capability_offset = 1 + 32 + 32 + 1 + 1 + 1;
     assert_eq!(widened[capability_offset - 1], 1);
     assert_eq!(widened[capability_offset], 0);
     widened[capability_offset] = 2;
-    assert!(OpaqueDelegation::decode(&widened).is_err());
+    let err = Delegation::<Rpc>::decode(&widened).unwrap_err();
+    assert_matches!(err, DecodeError::InvalidSignature { .. });
 
     let mut padded = good.clone();
     let signature_start = padded.len() - SIGNATURE_LENGTH;
     padded.insert(signature_start, 0);
-    assert!(OpaqueDelegation::decode(&padded).is_err());
+    let err = Delegation::<Rpc>::decode(&padded).unwrap_err();
+    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("signature length"));
 
     let mut versioned = good.clone();
     versioned[0] = 3;
-    assert!(OpaqueDelegation::decode(&versioned).is_err());
+    let err = Delegation::<Rpc>::decode(&versioned).unwrap_err();
+    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("version"));
 
-    assert!(OpaqueDelegation::decode(&[]).is_err());
+    let err = Delegation::<Rpc>::decode(&[]).unwrap_err();
+    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("empty"));
 }
 
+/// A non-canonical v2 delegation with an overlong varint for the expiry time.
 const V2_NC_EXPIRY: &str = "
     02                                                               // version: v2
     3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 // issuer: key(0)
@@ -193,6 +191,7 @@ const V2_NC_EXPIRY: &str = "
     83461886f14cdfa8b2d60eaab3ce00098761aa2bbf8dd028820fd54211bf2cca // signature (over the canonical form)
     ccfc635242760b1c1d0d1d1c98943556f725c1e2c7edcd94365660e5af929f06
 ";
+/// A non-canonical v2 delegation with an overlong varint for the capability length prefix.
 const V2_NC_CAP_LEN: &str = "
     02                                                               // version: v2
     3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 // issuer: key(0)
@@ -206,13 +205,10 @@ const V2_NC_CAP_LEN: &str = "
 
 #[test]
 fn v2_rejects_non_canonical() {
-    assert!(OpaqueDelegation::decode(&hexdump(V2_POSTCARD)).is_ok());
+    assert!(Delegation::<Rpc>::decode(&hexdump(V2_POSTCARD)).is_ok());
     for nc in [V2_NC_EXPIRY, V2_NC_CAP_LEN] {
-        let err = OpaqueDelegation::decode(&hexdump(nc)).unwrap_err();
-        assert!(
-            err.to_string().contains("canonical"),
-            "expected a non-canonical error, got: {err}"
-        );
+        let err = Delegation::<Rpc>::decode(&hexdump(nc)).unwrap_err();
+        assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("canonical"));
     }
 }
 
@@ -220,54 +216,44 @@ fn v2_rejects_non_canonical() {
 fn rejects_v1() {
     for lead in [0x01u8, 0x20u8] {
         let bytes = [lead; 8];
+        let err = Delegation::<Rpc>::decode(&bytes).unwrap_err();
+        assert_matches!(err, DecodeError::UnsupportedV1 { .. });
         let err = OpaqueDelegation::decode(&bytes).unwrap_err();
-        assert!(
-            err.to_string().contains("v1"),
-            "expected a v1 rejection, got: {err}"
-        );
-        assert!(Delegation::<Rpc>::decode(&bytes).is_err());
+        assert_matches!(err, DecodeError::UnsupportedV1 { .. });
     }
 }
 
 #[test]
-fn typed_delegation() {
-    let issuer = key(0);
-    let audience = key(1).verifying_key();
-
-    let typed =
-        Delegation::issuing_builder(&issuer, audience, &Rpc::ReadWrite).sign(Expires::Never);
+fn opaque_roundtrip() {
+    let typed = delegation();
     assert_eq!(typed.capability(), Rpc::ReadWrite);
 
     let untyped: OpaqueDelegation = typed.clone().into();
     let again = Delegation::<Rpc>::try_from(untyped.clone()).unwrap();
     assert_eq!(again, typed);
 
+    let decoded = OpaqueDelegation::decode(&typed.encode()).unwrap();
+    let again = Delegation::<Rpc>::try_from(decoded).unwrap();
+    assert_eq!(again, typed);
+}
+
+#[test]
+fn foreign_vocabulary_rejected() {
     #[derive(Debug, Serialize, Deserialize)]
     struct OtherVocabulary {
         topic: String,
         write: bool,
     }
-    assert!(Delegation::<OtherVocabulary>::try_from(untyped.clone()).is_err());
+
+    let typed = delegation();
+    let untyped: OpaqueDelegation = typed.clone().into();
+    let err = Delegation::<OtherVocabulary>::try_from(untyped).unwrap_err();
+    assert_matches!(err, DecodeError::ForeignVocabulary { .. });
+    let err = Delegation::<OtherVocabulary>::decode(&typed.encode()).unwrap_err();
+    assert_matches!(err, DecodeError::ForeignVocabulary { .. });
 
     let wire = postcard::to_stdvec(&typed).unwrap();
     assert!(postcard::from_bytes::<Delegation<OtherVocabulary>>(&wire).is_err());
-
-    let bob = key(2);
-    let typed_link = Delegation::delegating_builder(
-        &key(1),
-        bob.verifying_key(),
-        issuer.verifying_key(),
-        &Rpc::Read,
-    )
-    .sign(Expires::Never);
-    let root = Delegation::issuing_builder(&issuer, audience, &Rpc::All).sign(Expires::Never);
-    let authorizer = Authorizer::new(issuer.verifying_key());
-    authorizer
-        .check_invocation_from(bob.verifying_key(), Rpc::Read, &[&root, &typed_link])
-        .unwrap();
-    assert!(authorizer
-        .check_invocation_from(bob.verifying_key(), Rpc::ReadWrite, &[&root, &typed_link])
-        .is_err());
 }
 
 #[test]
@@ -276,37 +262,53 @@ fn two_link_chain_invocation() {
     let alice = key(1);
     let bob = key(2);
 
-    let root: OpaqueDelegation =
-        Delegation::issuing_builder(&service, alice.verifying_key(), &Rpc::All)
-            .sign(Expires::At(4_102_444_800))
-            .into();
+    let root = Delegation::issuing_builder(&service, alice.verifying_key(), &Rpc::All)
+        .sign(Expires::At(4_102_444_800));
 
-    let link: OpaqueDelegation = Delegation::delegating_builder(
+    let link = Delegation::delegating_builder(
         &alice,
         bob.verifying_key(),
         service.verifying_key(),
         &Rpc::Read,
     )
-    .sign(Expires::Never)
-    .into();
+    .sign(Expires::Never);
 
     let authorizer = Authorizer::new(service.verifying_key());
     let chain = [&root, &link];
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
     authorizer
-        .check_opaque_invocation_from_at(now, bob.verifying_key(), Rpc::Read, &chain)
+        .check_invocation_from_at(now, bob.verifying_key(), Rpc::Read, &chain)
         .unwrap();
-    assert!(authorizer
-        .check_opaque_invocation_from_at(now, bob.verifying_key(), Rpc::ReadWrite, &chain)
-        .is_err());
-    assert!(authorizer
-        .check_opaque_invocation_from_at(now, key(3).verifying_key(), Rpc::Read, &chain)
-        .is_err());
+    let err = authorizer
+        .check_invocation_from_at(now, bob.verifying_key(), Rpc::ReadWrite, &chain)
+        .unwrap_err();
+    assert_matches!(err, InvocationError::NotPermitted { .. });
+    let err = authorizer
+        .check_invocation_from_at(now, key(3).verifying_key(), Rpc::Read, &chain)
+        .unwrap_err();
+    assert_matches!(&err, InvocationError::WrongInvoker { invoker, chain_end, .. }
+        if invoker == &key(3).verifying_key() && chain_end == &bob.verifying_key());
     let late = SystemTime::UNIX_EPOCH + Duration::from_secs(4_102_444_801);
-    assert!(authorizer
-        .check_opaque_invocation_from_at(late, bob.verifying_key(), Rpc::Read, &chain)
-        .is_err());
+    let err = authorizer
+        .check_invocation_from_at(late, bob.verifying_key(), Rpc::Read, &chain)
+        .unwrap_err();
+    assert_matches!(
+        err,
+        InvocationError::Expired {
+            expiry: Expires::At(4_102_444_800),
+            ..
+        }
+    );
+
+    let opaque_chain = [root.opaque(), link.opaque()];
+    authorizer
+        .check_opaque_invocation_from_at(now, bob.verifying_key(), Rpc::Read, &opaque_chain)
+        .unwrap();
+    let err = authorizer
+        .check_opaque_invocation_from_at(now, bob.verifying_key(), Rpc::ReadWrite, &opaque_chain)
+        .unwrap_err();
+    assert_matches!(err, InvocationError::NotPermitted { .. });
 }
 
 #[test]
@@ -315,14 +317,14 @@ fn chain_must_start_at_the_authorizer() {
     let alice = key(1);
     let bob = key(2);
 
-    let alice_grant: OpaqueDelegation =
-        Delegation::issuing_builder(&alice, bob.verifying_key(), &Rpc::All)
-            .sign(Expires::Never)
-            .into();
+    let alice_grant =
+        Delegation::issuing_builder(&alice, bob.verifying_key(), &Rpc::All).sign(Expires::Never);
     let authorizer = Authorizer::new(service.verifying_key());
-    assert!(authorizer
-        .check_opaque_invocation_from(bob.verifying_key(), Rpc::Read, &[&alice_grant])
-        .is_err());
+    let err = authorizer
+        .check_invocation_from(bob.verifying_key(), Rpc::Read, &[&alice_grant])
+        .unwrap_err();
+    assert_matches!(&err, InvocationError::ChainBroken { expected, found, .. }
+        if expected == &service.verifying_key() && found == &alice.verifying_key());
 }
 
 #[test]
@@ -331,18 +333,19 @@ fn subject_must_be_the_authorizer() {
     let other = key(1);
     let alice = key(2);
 
-    let delegation: OpaqueDelegation = Delegation::delegating_builder(
+    let foreign_grant = Delegation::delegating_builder(
         &service,
         alice.verifying_key(),
         other.verifying_key(),
         &Rpc::All,
     )
-    .sign(Expires::Never)
-    .into();
+    .sign(Expires::Never);
     let authorizer = Authorizer::new(service.verifying_key());
-    assert!(authorizer
-        .check_opaque_invocation_from(alice.verifying_key(), Rpc::Read, &[&delegation])
-        .is_err());
+    let err = authorizer
+        .check_invocation_from(alice.verifying_key(), Rpc::Read, &[&foreign_grant])
+        .unwrap_err();
+    assert_matches!(&err, InvocationError::WrongCapabilityIssuer { authorizer, .. }
+        if authorizer == &service.verifying_key());
 }
 
 #[test]
@@ -350,9 +353,11 @@ fn owner_needs_no_chain() {
     let service = key(0);
     let authorizer = Authorizer::new(service.verifying_key());
     authorizer
-        .check_opaque_invocation_from(service.verifying_key(), Rpc::All, &[])
+        .check_invocation_from::<Rpc>(service.verifying_key(), Rpc::All, &[])
         .unwrap();
-    assert!(authorizer
-        .check_opaque_invocation_from(key(1).verifying_key(), Rpc::Read, &[])
-        .is_err());
+    let err = authorizer
+        .check_invocation_from::<Rpc>(key(1).verifying_key(), Rpc::Read, &[])
+        .unwrap_err();
+    assert_matches!(&err, InvocationError::WrongInvoker { invoker, chain_end, .. }
+        if invoker == &key(1).verifying_key() && chain_end == &service.verifying_key());
 }

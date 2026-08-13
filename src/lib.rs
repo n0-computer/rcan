@@ -353,6 +353,12 @@ impl<C> Delegation<C> {
     pub fn encode(&self) -> Vec<u8> {
         self.opaque.encode()
     }
+
+    /// Encodes the delegation into a base32 string of the byte encoding produced
+    /// by [`Self::encode`].
+    pub fn encode_string(&self) -> String {
+        self.opaque.encode_string()
+    }
 }
 
 impl<C: Serialize + DeserializeOwned> Delegation<C> {
