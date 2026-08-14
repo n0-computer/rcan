@@ -18,43 +18,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[cfg(test)]
 mod tests;
 
-/// The domain-separation tag distinguishing rcan delegations from other
-/// ed25519-signed data. Exposed for applications that re-verify signatures.
-pub const DST: &[u8] = b"rcan-2-delegation";
-
-/// A capability that can be converted to and from its byte representation.
-///
-/// The bytes are what a [`Delegation`] stores and signs. You usually won't
-/// implement this yourself: any [`Serialize`] + [`Deserialize`] type is
-/// supported automatically.
-pub trait CapabilityEncoding {
-    /// Returns the bytes this capability is represented as inside a delegation.
-    fn encode(&self) -> Vec<u8>;
-
-    /// Decodes a capability from its bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DecodeError::WrongCapability`] if `bytes` is not a valid
-    /// encoding of this capability.
-    fn decode(bytes: &[u8]) -> Result<Self, DecodeError>
-    where
-        Self: Sized;
-}
-
-impl<T: Serialize + DeserializeOwned> CapabilityEncoding for T {
-    fn encode(&self) -> Vec<u8> {
-        postcard::to_stdvec(self).expect("capability serializes")
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        match postcard::take_from_bytes::<Self>(bytes) {
-            Ok((value, [])) => Ok(value),
-            _ => Err(e!(DecodeError::WrongCapability)),
-        }
-    }
-}
-
 /// A grantable capability.
 ///
 /// Implement this for your own capability type, typically an enum of the
@@ -65,191 +28,6 @@ impl<T: Serialize + DeserializeOwned> CapabilityEncoding for T {
 pub trait Capability: CapabilityEncoding {
     /// Returns `true` if `self` grants the permissions described by `other`.
     fn permits(&self, other: &Self) -> bool;
-}
-
-/// The authority that verifies an invocation.
-///
-/// An [`Authorizer`] holds the public key of the principal that first issued a
-/// capability. `check_invocation_from` verifies that an invocation is backed by
-/// an unexpired, unbroken chain of delegations originating from that principal.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Authorizer {
-    principal: VerifyingKey,
-}
-
-#[allow(clippy::result_large_err)]
-impl Authorizer {
-    /// Returns an authorizer for the given principal.
-    pub fn new(principal: VerifyingKey) -> Self {
-        Self { principal }
-    }
-
-    /// Verifies an invocation of `capability` by `invoker`, backed by
-    /// `proof_chain`.
-    ///
-    /// The chain must start with the delegation issued by this authorizer's
-    /// principal and end at `invoker`. Make sure the invoker signed and
-    /// authenticated the message carrying `capability`; this method only
-    /// checks the capability chain itself.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use ed25519_dalek::SigningKey;
-    /// use rcan::{Authorizer, Capability, Delegation, Expires};
-    /// use serde::{Deserialize, Serialize};
-    ///
-    /// #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    /// enum Cap {
-    ///     Read,
-    ///     All,
-    /// }
-    /// impl Capability for Cap {
-    ///     fn permits(&self, other: &Self) -> bool {
-    ///         *self == Cap::All || self == other
-    ///     }
-    /// }
-    ///
-    /// let service = SigningKey::from_bytes(&[0u8; 32]);
-    /// let alice = SigningKey::from_bytes(&[1u8; 32]);
-    ///
-    /// let grant = Delegation::issuing_builder(&service, alice.verifying_key(), &Cap::All)
-    ///     .sign(Expires::Never);
-    ///
-    /// let authorizer = Authorizer::new(service.verifying_key());
-    /// authorizer
-    ///     .check_invocation_from(alice.verifying_key(), Cap::Read, &[&grant])
-    ///     .unwrap();
-    /// ```
-    pub fn check_invocation_from<C: Capability>(
-        &self,
-        invoker: VerifyingKey,
-        capability: C,
-        proof_chain: &[&Delegation<C>],
-    ) -> Result<(), InvocationError> {
-        self.check_invocation_from_at(SystemTime::now(), invoker, capability, proof_chain)
-    }
-
-    /// Like [`check_invocation_from`](Self::check_invocation_from), but evaluates
-    /// expiry against an explicit time instead of "now".
-    ///
-    /// Opaque delegations are not checked directly; parse them into a typed
-    /// delegation with [`OpaqueDelegation::parse`] first, then check them here.
-    pub fn check_invocation_from_at<C: Capability>(
-        &self,
-        now: SystemTime,
-        invoker: VerifyingKey,
-        capability: C,
-        proof_chain: &[&Delegation<C>],
-    ) -> Result<(), InvocationError> {
-        // The chain is checked back-to-front: it starts at the owner of the
-        // capability and each delegation names the next issuer.
-        let mut current_issuer = &self.principal;
-        for proof in proof_chain {
-            if proof.issuer() != current_issuer {
-                return Err(e!(InvocationError::ChainBroken {
-                    expected: *current_issuer,
-                    found: *proof.issuer(),
-                }));
-            }
-            if !proof.expires().is_valid_at(now) {
-                return Err(e!(InvocationError::Expired {
-                    expiry: proof.expires().clone(),
-                }));
-            }
-            if proof.capability_owner() != &self.principal {
-                return Err(e!(InvocationError::CapabilityOwnerMismatch {
-                    authorizer: self.principal,
-                }));
-            }
-            if !proof.capability().permits(&capability) {
-                return Err(e!(InvocationError::NotPermitted));
-            }
-            current_issuer = proof.audience();
-        }
-        if &invoker != current_issuer {
-            return Err(e!(InvocationError::InvokerMismatch {
-                invoker,
-                chain_end: *current_issuer,
-            }));
-        }
-        Ok(())
-    }
-}
-
-/// A capability as raw, uninterpreted bytes.
-///
-/// Used by [`OpaqueDelegation`] to carry a delegation whose capability type is
-/// not (yet) known. Any byte string is a valid `OpaqueCapability`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpaqueCapability(Vec<u8>);
-
-impl OpaqueCapability {
-    /// Returns the underlying capability bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl CapabilityEncoding for OpaqueCapability {
-    fn encode(&self) -> Vec<u8> {
-        self.0.clone()
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        Ok(Self(bytes.to_vec()))
-    }
-}
-
-impl Capability for OpaqueCapability {
-    fn permits(&self, other: &Self) -> bool {
-        self == other
-    }
-}
-
-/// A delegation whose capability is held as raw bytes rather than a typed
-/// value. See [`Delegation`].
-pub type OpaqueDelegation = Delegation<OpaqueCapability>;
-
-impl Delegation<OpaqueCapability> {
-    /// Parses this delegation's capability bytes as a `C`, yielding a typed
-    /// [`Delegation<C>`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DecodeError::WrongCapability`] if the bytes are not a valid
-    /// encoding of `C` (unless `C` is [`OpaqueCapability`], which accepts any
-    /// bytes).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use ed25519_dalek::SigningKey;
-    /// use rcan::{Delegation, Expires, OpaqueDelegation};
-    /// use serde::{Deserialize, Serialize};
-    ///
-    /// #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    /// enum Cap {
-    ///     Read,
-    /// }
-    ///
-    /// let key = SigningKey::from_bytes(&[0u8; 32]);
-    /// let typed =
-    ///     Delegation::issuing_builder(&key, key.verifying_key(), &Cap::Read).sign(Expires::Never);
-    /// let opaque = typed.into_opaque();
-    /// let back: Delegation<Cap> = opaque.parse().unwrap();
-    /// ```
-    pub fn parse<C: CapabilityEncoding>(self) -> Result<Delegation<C>, DecodeError> {
-        let capability = C::decode(self.capability.as_bytes())?;
-        Ok(Delegation::new(
-            self.issuer,
-            self.audience,
-            self.capability_origin,
-            self.valid_until,
-            capability,
-            self.signature,
-        ))
-    }
 }
 
 /// A signed delegation granting a capability.
@@ -388,38 +166,139 @@ impl<C: CapabilityEncoding> Delegation<C> {
     }
 }
 
-fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C>, DecodeError> {
-    if bytes.len() < SIGNATURE_LENGTH {
-        return Err(DecodeError::malformed("invalid signature length"));
+impl<C: Clone> Delegation<C> {
+    /// Returns a builder for a delegation that `issuer` issues to `audience`
+    /// for `capability`, where `issuer` is the origin of the capability.
+    pub fn issuing_builder<'s>(
+        issuer: &'s SigningKey,
+        audience: VerifyingKey,
+        capability: &C,
+    ) -> DelegationBuilder<'s, C> {
+        DelegationBuilder {
+            issuer,
+            audience,
+            capability_origin: CapabilityOrigin::Issuer,
+            capability: capability.clone(),
+        }
     }
-    let (body_bytes, sig_bytes) = bytes.split_at(bytes.len() - SIGNATURE_LENGTH);
-    let mut body = body_bytes;
-    let delegation = decode_body::<C>(&mut body)?;
-    if !body.is_empty() {
-        return Err(DecodeError::malformed("non canonical encoding of payload"));
+
+    /// Returns a builder for a delegation that `issuer` issues to `audience`
+    /// for `capability`, where the capability was originally held by `owner`.
+    pub fn delegating_builder<'s>(
+        issuer: &'s SigningKey,
+        audience: VerifyingKey,
+        owner: VerifyingKey,
+        capability: &C,
+    ) -> DelegationBuilder<'s, C> {
+        DelegationBuilder {
+            issuer,
+            audience,
+            capability_origin: CapabilityOrigin::Delegation(owner),
+            capability: capability.clone(),
+        }
     }
-    let signature = Signature::from_bytes(
-        sig_bytes
-            .try_into()
-            .map_err(|_| DecodeError::malformed("invalid signature length"))?,
-    );
-    let mut to_verify = DST.to_vec();
-    encode_body::<C>(&delegation, &mut to_verify);
-    if to_verify[DST.len()..] != *body_bytes {
-        return Err(DecodeError::malformed("non canonical encoding of payload"));
+}
+
+/// Serializes the delegation as its byte encoding, or as a base32 string when
+/// the format is human-readable. See [`Delegation::encode`].
+impl<C: CapabilityEncoding> Serialize for Delegation<C> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.encode_string())
+        } else {
+            self.encode().serialize(serializer)
+        }
     }
-    delegation
-        .issuer
-        .verify_strict(&to_verify, &signature)
-        .map_err(|_| e!(DecodeError::InvalidSignature))?;
-    Ok(Delegation::new(
-        delegation.issuer,
-        delegation.audience,
-        delegation.capability_origin,
-        delegation.valid_until,
-        delegation.capability,
-        signature,
-    ))
+}
+
+/// See [`Delegation::decode`], which this forwards to.
+impl<'de, C: CapabilityEncoding> Deserialize<'de> for Delegation<C> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let delegation = if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            Self::decode_string(&s)
+        } else {
+            let v = Vec::<u8>::deserialize(deserializer)?;
+            Self::decode(&v)
+        };
+        delegation.map_err(D::Error::custom)
+    }
+}
+
+/// A capability as raw, uninterpreted bytes.
+///
+/// Used by [`OpaqueDelegation`] to carry a delegation whose capability type is
+/// not (yet) known. Any byte string is a valid `OpaqueCapability`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpaqueCapability(Vec<u8>);
+
+impl OpaqueCapability {
+    /// Returns the underlying capability bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl CapabilityEncoding for OpaqueCapability {
+    fn encode(&self) -> Vec<u8> {
+        self.0.clone()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self(bytes.to_vec()))
+    }
+}
+
+impl Capability for OpaqueCapability {
+    fn permits(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+/// A delegation whose capability is held as raw bytes rather than a typed
+/// value. See [`Delegation`].
+pub type OpaqueDelegation = Delegation<OpaqueCapability>;
+
+impl Delegation<OpaqueCapability> {
+    /// Parses this delegation's capability bytes as a `C`, yielding a typed
+    /// [`Delegation<C>`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::WrongCapability`] if the bytes are not a valid
+    /// encoding of `C` (unless `C` is [`OpaqueCapability`], which accepts any
+    /// bytes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ed25519_dalek::SigningKey;
+    /// use rcan::{Delegation, Expires, OpaqueDelegation};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    /// enum Cap {
+    ///     Read,
+    /// }
+    ///
+    /// let key = SigningKey::from_bytes(&[0u8; 32]);
+    /// let typed =
+    ///     Delegation::issuing_builder(&key, key.verifying_key(), &Cap::Read).sign(Expires::Never);
+    /// let opaque = typed.into_opaque();
+    /// let back: Delegation<Cap> = opaque.parse().unwrap();
+    /// ```
+    pub fn parse<C: CapabilityEncoding>(self) -> Result<Delegation<C>, DecodeError> {
+        let capability = C::decode(self.capability.as_bytes())?;
+        Ok(Delegation::new(
+            self.issuer,
+            self.audience,
+            self.capability_origin,
+            self.valid_until,
+            capability,
+            self.signature,
+        ))
+    }
 }
 
 /// Where a delegated capability comes from.
@@ -467,39 +346,6 @@ impl Expires {
     }
 }
 
-impl<C: Clone> Delegation<C> {
-    /// Returns a builder for a delegation that `issuer` issues to `audience`
-    /// for `capability`, where `issuer` is the origin of the capability.
-    pub fn issuing_builder<'s>(
-        issuer: &'s SigningKey,
-        audience: VerifyingKey,
-        capability: &C,
-    ) -> DelegationBuilder<'s, C> {
-        DelegationBuilder {
-            issuer,
-            audience,
-            capability_origin: CapabilityOrigin::Issuer,
-            capability: capability.clone(),
-        }
-    }
-
-    /// Returns a builder for a delegation that `issuer` issues to `audience`
-    /// for `capability`, where the capability was originally held by `owner`.
-    pub fn delegating_builder<'s>(
-        issuer: &'s SigningKey,
-        audience: VerifyingKey,
-        owner: VerifyingKey,
-        capability: &C,
-    ) -> DelegationBuilder<'s, C> {
-        DelegationBuilder {
-            issuer,
-            audience,
-            capability_origin: CapabilityOrigin::Delegation(owner),
-            capability: capability.clone(),
-        }
-    }
-}
-
 /// Builds and signs a [`Delegation`].
 pub struct DelegationBuilder<'s, C> {
     issuer: &'s SigningKey,
@@ -526,6 +372,149 @@ impl<C: CapabilityEncoding + Clone> DelegationBuilder<'_, C> {
         Delegation {
             signature,
             ..delegation
+        }
+    }
+}
+
+/// The authority that verifies an invocation.
+///
+/// An [`Authorizer`] holds the public key of the principal that first issued a
+/// capability. `check_invocation_from` verifies that an invocation is backed by
+/// an unexpired, unbroken chain of delegations originating from that principal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Authorizer {
+    principal: VerifyingKey,
+}
+
+#[allow(clippy::result_large_err)]
+impl Authorizer {
+    /// Returns an authorizer for the given principal.
+    pub fn new(principal: VerifyingKey) -> Self {
+        Self { principal }
+    }
+
+    /// Verifies an invocation of `capability` by `invoker`, backed by
+    /// `proof_chain`.
+    ///
+    /// The chain must start with the delegation issued by this authorizer's
+    /// principal and end at `invoker`. Make sure the invoker signed and
+    /// authenticated the message carrying `capability`; this method only
+    /// checks the capability chain itself.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ed25519_dalek::SigningKey;
+    /// use rcan::{Authorizer, Capability, Delegation, Expires};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    /// enum Cap {
+    ///     Read,
+    ///     All,
+    /// }
+    /// impl Capability for Cap {
+    ///     fn permits(&self, other: &Self) -> bool {
+    ///         *self == Cap::All || self == other
+    ///     }
+    /// }
+    ///
+    /// let service = SigningKey::from_bytes(&[0u8; 32]);
+    /// let alice = SigningKey::from_bytes(&[1u8; 32]);
+    ///
+    /// let grant = Delegation::issuing_builder(&service, alice.verifying_key(), &Cap::All)
+    ///     .sign(Expires::Never);
+    ///
+    /// let authorizer = Authorizer::new(service.verifying_key());
+    /// authorizer
+    ///     .check_invocation_from(alice.verifying_key(), Cap::Read, &[&grant])
+    ///     .unwrap();
+    /// ```
+    pub fn check_invocation_from<C: Capability>(
+        &self,
+        invoker: VerifyingKey,
+        capability: C,
+        proof_chain: &[&Delegation<C>],
+    ) -> Result<(), InvocationError> {
+        self.check_invocation_from_at(SystemTime::now(), invoker, capability, proof_chain)
+    }
+
+    /// Like [`check_invocation_from`](Self::check_invocation_from), but evaluates
+    /// expiry against an explicit time instead of "now".
+    ///
+    /// Opaque delegations are not checked directly; parse them into a typed
+    /// delegation with [`OpaqueDelegation::parse`] first, then check them here.
+    pub fn check_invocation_from_at<C: Capability>(
+        &self,
+        now: SystemTime,
+        invoker: VerifyingKey,
+        capability: C,
+        proof_chain: &[&Delegation<C>],
+    ) -> Result<(), InvocationError> {
+        // The chain is checked back-to-front: it starts at the owner of the
+        // capability and each delegation names the next issuer.
+        let mut current_issuer = &self.principal;
+        for proof in proof_chain {
+            if proof.issuer() != current_issuer {
+                return Err(e!(InvocationError::ChainBroken {
+                    expected: *current_issuer,
+                    found: *proof.issuer(),
+                }));
+            }
+            if !proof.expires().is_valid_at(now) {
+                return Err(e!(InvocationError::Expired {
+                    expiry: proof.expires().clone(),
+                }));
+            }
+            if proof.capability_owner() != &self.principal {
+                return Err(e!(InvocationError::CapabilityOwnerMismatch {
+                    authorizer: self.principal,
+                }));
+            }
+            if !proof.capability().permits(&capability) {
+                return Err(e!(InvocationError::NotPermitted));
+            }
+            current_issuer = proof.audience();
+        }
+        if &invoker != current_issuer {
+            return Err(e!(InvocationError::InvokerMismatch {
+                invoker,
+                chain_end: *current_issuer,
+            }));
+        }
+        Ok(())
+    }
+}
+
+/// A capability that can be converted to and from its byte representation.
+///
+/// The bytes are what a [`Delegation`] stores and signs. You usually won't
+/// implement this yourself: any [`Serialize`] + [`Deserialize`] type is
+/// supported automatically.
+pub trait CapabilityEncoding {
+    /// Returns the bytes this capability is represented as inside a delegation.
+    fn encode(&self) -> Vec<u8>;
+
+    /// Decodes a capability from its bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::WrongCapability`] if `bytes` is not a valid
+    /// encoding of this capability.
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError>
+    where
+        Self: Sized;
+}
+
+impl<T: Serialize + DeserializeOwned> CapabilityEncoding for T {
+    fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("capability serializes")
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        match postcard::take_from_bytes::<Self>(bytes) {
+            Ok((value, [])) => Ok(value),
+            _ => Err(e!(DecodeError::WrongCapability)),
         }
     }
 }
@@ -596,35 +585,14 @@ pub enum InvocationError {
     },
 }
 
-/// Serializes the delegation as its byte encoding, or as a base32 string when
-/// the format is human-readable. See [`Delegation::encode`].
-impl<C: CapabilityEncoding> Serialize for Delegation<C> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if serializer.is_human_readable() {
-            serializer.serialize_str(&self.encode_string())
-        } else {
-            self.encode().serialize(serializer)
-        }
-    }
-}
+/// The domain-separation tag distinguishing rcan delegations from other
+/// ed25519-signed data. Exposed for applications that re-verify signatures.
+pub const DST: &[u8] = b"rcan-2-delegation";
 
-/// See [`Delegation::decode`], which this forwards to.
-impl<'de, C: CapabilityEncoding> Deserialize<'de> for Delegation<C> {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        let delegation = if deserializer.is_human_readable() {
-            let s = String::deserialize(deserializer)?;
-            Self::decode_string(&s)
-        } else {
-            let v = Vec::<u8>::deserialize(deserializer)?;
-            Self::decode(&v)
-        };
-        delegation.map_err(D::Error::custom)
-    }
-}
+pub(crate) const BASE32_LOWER_NOPAD: data_encoding::Encoding = data_encoding_macro::new_encoding!(
+    symbols: "abcdefghijklmnopqrstuvwxyz234567",
+);
 
-/// Encodes a delegation's payload (everything except its signature) into the
-/// canonical byte representation that gets signed.
 fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<u8>) {
     out.extend_from_slice(delegation.issuer.as_bytes());
     out.extend_from_slice(delegation.audience.as_bytes());
@@ -647,32 +615,38 @@ fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<
     out.extend_from_slice(&capability);
 }
 
-fn take_bytes<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], DecodeError> {
-    let (head, rest) = buf
-        .split_at_checked(n)
-        .ok_or_else(|| DecodeError::malformed("payload is truncated"))?;
-    *buf = rest;
-    Ok(head)
-}
-
-fn take_chunk<'a, const N: usize>(buf: &mut &'a [u8]) -> Result<&'a [u8; N], DecodeError> {
-    let Some((head, rest)) = buf.split_first_chunk() else {
-        return Err(DecodeError::malformed("payload is truncated"));
-    };
-    *buf = rest;
-    Ok(head)
-}
-
-fn take_key(buf: &mut &[u8]) -> Result<VerifyingKey, DecodeError> {
-    let bytes = take_chunk::<32>(buf)?;
-    VerifyingKey::from_bytes(bytes).map_err(|_| DecodeError::malformed("invalid key"))
-}
-
-fn take_u64(buf: &mut &[u8]) -> Result<u64, DecodeError> {
-    let (value, consumed) = bijoux::u64::decode(buf)
-        .map_err(|e| DecodeError::malformed(format!("invalid varint: {e}")))?;
-    *buf = &buf[consumed..];
-    Ok(value)
+fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C>, DecodeError> {
+    if bytes.len() < SIGNATURE_LENGTH {
+        return Err(DecodeError::malformed("invalid signature length"));
+    }
+    let (body_bytes, sig_bytes) = bytes.split_at(bytes.len() - SIGNATURE_LENGTH);
+    let mut body = body_bytes;
+    let delegation = decode_body::<C>(&mut body)?;
+    if !body.is_empty() {
+        return Err(DecodeError::malformed("non canonical encoding of payload"));
+    }
+    let signature = Signature::from_bytes(
+        sig_bytes
+            .try_into()
+            .map_err(|_| DecodeError::malformed("invalid signature length"))?,
+    );
+    let mut to_verify = DST.to_vec();
+    encode_body::<C>(&delegation, &mut to_verify);
+    if to_verify[DST.len()..] != *body_bytes {
+        return Err(DecodeError::malformed("non canonical encoding of payload"));
+    }
+    delegation
+        .issuer
+        .verify_strict(&to_verify, &signature)
+        .map_err(|_| e!(DecodeError::InvalidSignature))?;
+    Ok(Delegation::new(
+        delegation.issuer,
+        delegation.audience,
+        delegation.capability_origin,
+        delegation.valid_until,
+        delegation.capability,
+        signature,
+    ))
 }
 
 fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, DecodeError> {
@@ -707,6 +681,30 @@ fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, 
     ))
 }
 
-pub(crate) const BASE32_LOWER_NOPAD: data_encoding::Encoding = data_encoding_macro::new_encoding!(
-    symbols: "abcdefghijklmnopqrstuvwxyz234567",
-);
+fn take_bytes<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], DecodeError> {
+    let (head, rest) = buf
+        .split_at_checked(n)
+        .ok_or_else(|| DecodeError::malformed("payload is truncated"))?;
+    *buf = rest;
+    Ok(head)
+}
+
+fn take_chunk<'a, const N: usize>(buf: &mut &'a [u8]) -> Result<&'a [u8; N], DecodeError> {
+    let Some((head, rest)) = buf.split_first_chunk() else {
+        return Err(DecodeError::malformed("payload is truncated"));
+    };
+    *buf = rest;
+    Ok(head)
+}
+
+fn take_key(buf: &mut &[u8]) -> Result<VerifyingKey, DecodeError> {
+    let bytes = take_chunk::<32>(buf)?;
+    VerifyingKey::from_bytes(bytes).map_err(|_| DecodeError::malformed("invalid key"))
+}
+
+fn take_u64(buf: &mut &[u8]) -> Result<u64, DecodeError> {
+    let (value, consumed) = bijoux::u64::decode(buf)
+        .map_err(|e| DecodeError::malformed(format!("invalid varint: {e}")))?;
+    *buf = &buf[consumed..];
+    Ok(value)
+}
