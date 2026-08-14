@@ -37,10 +37,11 @@ pub trait Capability: CapabilityEncoding {
 /// expires. Delegations can be chained (see [`CapabilityOrigin`]) so a receiver
 /// can re-delegate an attenuated capability it was given.
 ///
-/// The [`OpaqueDelegation`] form carries the capability as raw bytes and is
-/// turned into a typed `Delegation<C>` with [`parse`](OpaqueDelegation::parse).
+/// Bare `Delegation` (the default `C = OpaqueCapability`) holds the capability
+/// as raw bytes; turn it into a typed `Delegation<C>` with
+/// [`try_into_typed`](Delegation::try_into_typed).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Delegation<C> {
+pub struct Delegation<C = OpaqueCapability> {
     issuer: VerifyingKey,
     audience: VerifyingKey,
     capability_origin: CapabilityOrigin,
@@ -108,10 +109,10 @@ impl<C> Delegation<C> {
 }
 
 impl<C: CapabilityEncoding> Delegation<C> {
-    /// Turns this delegation into an [`OpaqueDelegation`], encoding the
-    /// capability to bytes.
-    pub fn into_opaque(self) -> OpaqueDelegation {
-        OpaqueDelegation::new(
+    /// Turns this delegation into a `Delegation` with an opaque capability,
+    /// encoding the capability to bytes.
+    pub fn into_opaque(self) -> Delegation {
+        Delegation::new(
             self.issuer,
             self.audience,
             self.capability_origin,
@@ -228,8 +229,8 @@ impl<'de, C: CapabilityEncoding> Deserialize<'de> for Delegation<C> {
 
 /// A capability as raw, uninterpreted bytes.
 ///
-/// Used by [`OpaqueDelegation`] to carry a delegation whose capability type is
-/// not (yet) known. Any byte string is a valid `OpaqueCapability`.
+/// This is the default capability type of a [`Delegation`]: a delegation whose
+/// capability is not (yet) known. Any byte string is a valid `OpaqueCapability`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpaqueCapability(Vec<u8>);
 
@@ -256,13 +257,9 @@ impl Capability for OpaqueCapability {
     }
 }
 
-/// A delegation whose capability is held as raw bytes rather than a typed
-/// value. See [`Delegation`].
-pub type OpaqueDelegation = Delegation<OpaqueCapability>;
-
-impl Delegation<OpaqueCapability> {
-    /// Parses this delegation's capability bytes as a `C`, yielding a typed
-    /// [`Delegation<C>`].
+impl Delegation {
+    /// Consumes this delegation and returns it with the capability interpreted
+    /// as `C`, yielding a typed [`Delegation<C>`].
     ///
     /// # Errors
     ///
@@ -274,7 +271,7 @@ impl Delegation<OpaqueCapability> {
     ///
     /// ```
     /// use ed25519_dalek::SigningKey;
-    /// use rcan::{Delegation, Expires, OpaqueDelegation};
+    /// use rcan::{Delegation, Expires};
     /// use serde::{Deserialize, Serialize};
     ///
     /// #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,9 +283,9 @@ impl Delegation<OpaqueCapability> {
     /// let typed =
     ///     Delegation::issuing_builder(&key, key.verifying_key(), &Cap::Read).sign(Expires::Never);
     /// let opaque = typed.into_opaque();
-    /// let back: Delegation<Cap> = opaque.parse().unwrap();
+    /// let back: Delegation<Cap> = opaque.try_into_typed().unwrap();
     /// ```
-    pub fn parse<C: CapabilityEncoding>(self) -> Result<Delegation<C>, DecodeError> {
+    pub fn try_into_typed<C: CapabilityEncoding>(self) -> Result<Delegation<C>, DecodeError> {
         let capability = C::decode(self.capability.as_bytes())?;
         Ok(Delegation::new(
             self.issuer,
@@ -443,7 +440,8 @@ impl Authorizer {
     /// expiry against an explicit time instead of "now".
     ///
     /// Opaque delegations are not checked directly; parse them into a typed
-    /// delegation with [`OpaqueDelegation::parse`] first, then check them here.
+    /// delegation with [`try_into_typed`](Delegation::try_into_typed) first,
+    /// then check them here.
     pub fn check_invocation_from_at<C: Capability>(
         &self,
         now: SystemTime,

@@ -4,7 +4,7 @@ use n0_future::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Authorizer, Capability, DecodeError, Delegation, Expires, InvocationError, OpaqueDelegation,
+    Authorizer, Capability, DecodeError, Delegation, Expires, InvocationError, OpaqueCapability,
     BASE32_LOWER_NOPAD,
 };
 
@@ -98,7 +98,7 @@ fn wire_snapshots() {
         never
     );
 
-    let opaque = OpaqueDelegation::decode(&bytes).unwrap();
+    let opaque = Delegation::decode(&bytes).unwrap();
     assert_eq!(opaque, v2.into_opaque());
 }
 
@@ -108,7 +108,7 @@ fn string_snapshots() {
     assert_eq!(v2.encode_string(), V2_STRING);
     assert_eq!(Delegation::<Rpc>::decode_string(V2_STRING).unwrap(), v2);
 
-    let opaque = OpaqueDelegation::decode_string(V2_STRING).unwrap();
+    let opaque = Delegation::decode_string(V2_STRING).unwrap();
     assert_eq!(opaque, v2.into_opaque());
 
     let mut bytes = BASE32_LOWER_NOPAD.decode(V2_STRING.as_bytes()).unwrap();
@@ -129,9 +129,9 @@ fn serde_delegates_to_encode() {
     assert_eq!(wire, postcard_expected);
     assert_eq!(postcard::from_bytes::<Delegation<Rpc>>(&wire).unwrap(), v2);
     // The opaque form round-trips through the same wire encoding.
-    let opaque: OpaqueDelegation = v2.clone().into_opaque();
+    let opaque: Delegation = v2.clone().into_opaque();
     assert_eq!(opaque.encode(), v2.encode());
-    assert_eq!(OpaqueDelegation::decode(&v2.encode()).unwrap(), opaque);
+    assert_eq!(Delegation::decode(&v2.encode()).unwrap(), opaque);
 
     let mut cbor = Vec::new();
     ciborium::into_writer(&v2, &mut cbor).unwrap();
@@ -204,7 +204,7 @@ fn rejects_v1() {
         let bytes = [lead; 8];
         let err = Delegation::<Rpc>::decode(&bytes).unwrap_err();
         assert_matches!(err, DecodeError::UnsupportedV1 { .. });
-        let err = OpaqueDelegation::decode(&bytes).unwrap_err();
+        let err = Delegation::<OpaqueCapability>::decode(&bytes).unwrap_err();
         assert_matches!(err, DecodeError::UnsupportedV1 { .. });
     }
 }
@@ -214,12 +214,12 @@ fn opaque_roundtrip() {
     let typed = delegation();
     assert_eq!(*typed.capability(), Rpc::ReadWrite);
 
-    let untyped: OpaqueDelegation = typed.clone().into_opaque();
-    let again = untyped.clone().parse::<Rpc>().unwrap();
+    let untyped: Delegation = typed.clone().into_opaque();
+    let again = untyped.clone().try_into_typed::<Rpc>().unwrap();
     assert_eq!(again, typed);
 
-    let decoded = OpaqueDelegation::decode(&typed.encode()).unwrap();
-    let again = decoded.parse::<Rpc>().unwrap();
+    let decoded = Delegation::decode(&typed.encode()).unwrap();
+    let again = decoded.try_into_typed::<Rpc>().unwrap();
     assert_eq!(again, typed);
 }
 
@@ -232,8 +232,8 @@ fn rejects_wrong_capability_type() {
     }
 
     let typed = delegation();
-    let untyped: OpaqueDelegation = typed.clone().into_opaque();
-    let err = untyped.parse::<OtherCapability>().unwrap_err();
+    let untyped: Delegation = typed.clone().into_opaque();
+    let err = untyped.try_into_typed::<OtherCapability>().unwrap_err();
     assert_matches!(err, DecodeError::WrongCapability { .. });
     let err = Delegation::<OtherCapability>::decode(&typed.encode()).unwrap_err();
     assert_matches!(err, DecodeError::WrongCapability { .. });
@@ -291,8 +291,8 @@ fn two_link_chain_invocation() {
     let opaque_link = link.into_opaque();
     // Opaque delegations are checked by parsing them into typed delegations first.
     let parsed_chain = [
-        opaque_root.parse::<Rpc>().unwrap(),
-        opaque_link.parse::<Rpc>().unwrap(),
+        opaque_root.try_into_typed::<Rpc>().unwrap(),
+        opaque_link.try_into_typed::<Rpc>().unwrap(),
     ];
     let refs = [&parsed_chain[0], &parsed_chain[1]];
     authorizer
