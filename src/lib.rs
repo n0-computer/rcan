@@ -169,13 +169,6 @@ fn capability_predicate<C: Capability, T: AsRef<OpaqueDelegation>>(
     }
 }
 
-/// Combines a payload and its signature.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Signed {
-    payload: Payload,
-    signature: Signature,
-}
-
 /// A token for attenuated capability delegations.
 ///
 /// An [`OpaqueDelegation`] is guaranteed to be a valid delegation with a valid
@@ -183,7 +176,10 @@ struct Signed {
 ///
 /// The opaque variant keeps the capability as a byte array.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpaqueDelegation(Signed);
+pub struct OpaqueDelegation {
+    payload: Payload,
+    signature: Signature,
+}
 
 impl OpaqueDelegation {
     /// Decodes a v2 delegation from bytes, verifying the signature and canonical encoding.
@@ -199,7 +195,7 @@ impl OpaqueDelegation {
             .issuer
             .verify_strict(&to_verify, &signature)
             .map_err(|_| e!(DecodeError::InvalidSignature))?;
-        Ok(Self(Signed { payload, signature }))
+        Ok(Self { payload, signature })
     }
 
     /// Decodes a delegation from bytes, verifying the signature and canonical encoding.
@@ -220,8 +216,8 @@ impl OpaqueDelegation {
 
     /// Encodes the delegation into bytes, including the version byte.
     pub fn encode(&self) -> Vec<u8> {
-        let mut res = postcard::to_extend(&self.0.payload, vec![2u8]).expect("payload serializes");
-        res.extend_from_slice(&self.0.signature.to_bytes());
+        let mut res = postcard::to_extend(&self.payload, vec![2u8]).expect("payload serializes");
+        res.extend_from_slice(&self.signature.to_bytes());
         res
     }
 
@@ -240,12 +236,12 @@ impl OpaqueDelegation {
 
     /// The payload of the delegation.
     pub fn payload(&self) -> &Payload {
-        &self.0.payload
+        &self.payload
     }
 
     /// The signature of the delegation.
     pub fn signature(&self) -> &Signature {
-        &self.0.signature
+        &self.signature
     }
 
     /// The issuer of the delegation.
@@ -593,7 +589,7 @@ impl<C> DelegationBuilder<'_, C> {
         };
         let to_sign = postcard::to_extend(&payload, DST.to_vec()).expect("payload serializes");
         let signature = self.issuer.sign(&to_sign);
-        Delegation::new(OpaqueDelegation(Signed { payload, signature }))
+        Delegation::new(OpaqueDelegation { payload, signature })
     }
 }
 
