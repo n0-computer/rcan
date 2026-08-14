@@ -354,9 +354,7 @@ impl<C: CapabilityEncoding> Delegation<C> {
     /// Returns a lowercase base32 string of the delegation's byte encoding,
     /// useful for compact, printable representations.
     pub fn encode_string(&self) -> String {
-        let mut out = data_encoding::BASE32_NOPAD.encode(&self.encode());
-        out.make_ascii_lowercase();
-        out
+        BASE32_LOWER_NOPAD.encode(&self.encode())
     }
 
     /// Decodes a delegation from its byte encoding, verifying the signature and
@@ -383,7 +381,10 @@ impl<C: CapabilityEncoding> Delegation<C> {
     /// Decodes a delegation from a base32 string, verifying the signature and
     /// decoding the capability as `C`. See [`decode`](Delegation::decode).
     pub fn decode_string(s: &str) -> Result<Self, DecodeError> {
-        Self::decode(&base32_bytes(s)?)
+        let bytes = BASE32_LOWER_NOPAD
+            .decode(s.as_bytes())
+            .map_err(DecodeError::malformed)?;
+        Self::decode(&bytes)
     }
 }
 
@@ -706,8 +707,6 @@ fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, 
     ))
 }
 
-fn base32_bytes(s: &str) -> Result<Vec<u8>, DecodeError> {
-    data_encoding::BASE32_NOPAD
-        .decode(s.to_ascii_uppercase().as_bytes())
-        .map_err(DecodeError::malformed)
-}
+pub(crate) const BASE32_LOWER_NOPAD: data_encoding::Encoding = data_encoding_macro::new_encoding!(
+    symbols: "abcdefghijklmnopqrstuvwxyz234567",
+);

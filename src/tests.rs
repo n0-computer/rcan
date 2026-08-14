@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Authorizer, Capability, DecodeError, Delegation, Expires, InvocationError, OpaqueDelegation,
+    BASE32_LOWER_NOPAD,
 };
 
 /// An example capability type for testing.
@@ -110,13 +111,10 @@ fn string_snapshots() {
     let opaque = OpaqueDelegation::decode_string(V2_STRING).unwrap();
     assert_eq!(opaque, v2.into_opaque());
 
-    let mut bytes = data_encoding::BASE32_NOPAD
-        .decode(V2_STRING.to_ascii_uppercase().as_bytes())
-        .unwrap();
+    let mut bytes = BASE32_LOWER_NOPAD.decode(V2_STRING.as_bytes()).unwrap();
     let n = bytes.len();
     bytes[n - 1] ^= 1;
-    let mut tampered = data_encoding::BASE32_NOPAD.encode(&bytes);
-    tampered.make_ascii_lowercase();
+    let tampered = BASE32_LOWER_NOPAD.encode(&bytes);
     let err = Delegation::<Rpc>::decode_string(&tampered).unwrap_err();
     assert_matches!(err, DecodeError::InvalidSignature { .. });
 }
