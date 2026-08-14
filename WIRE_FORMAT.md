@@ -26,13 +26,19 @@ multi-byte varint MUST have a nonzero payload. For example, `00` is the only
 encoding of zero; `80 00` is invalid.
 
 All integer values in this specification are unsigned. Expiry timestamps are
-`u64` values, so their varints are at most ten bytes and MUST not overflow
+`u64` values, so their varints are at most ten bytes and MUST NOT overflow
 `u64`.
 
 ### 2.2 Keys and signatures
 
-An `ed25519-key` is the 32-byte compressed Edwards-Y public-key encoding from
-RFC 8032. The bytes MUST decode as a valid Ed25519 verifying key.
+An `ed25519-key` is a 32-byte compressed Edwards-Y public-key encoding. Key
+parsing has the semantics of `ed25519-dalek` 3.0.0's
+`VerifyingKey::from_bytes`: the bytes MUST decompress to an Edwards point, but
+the encoded field element need not be canonical and the point may have small
+order. In particular, decompression reduces the encoded Y coordinate modulo
+the field prime. Signature verification imposes additional restrictions on the
+issuer key as described in section 4; audience and capability-owner keys are
+only parsed.
 
 An `ed25519-signature` is exactly 64 bytes: the 32-byte encoded `R` component
 followed by the 32-byte little-endian `S` component.
@@ -45,7 +51,9 @@ A variable-length byte string is encoded as:
 byte-string = varint(length) || length bytes
 ```
 
-The length varint is canonical as defined in section 2.1.
+The length varint is canonical as defined in section 2.1. The capability length
+is implicitly bounded by the token: after the capability bytes, exactly 64
+bytes must remain for the signature.
 
 ## 3. Delegation encoding
 
@@ -87,8 +95,9 @@ variant discriminants. Other discriminants are invalid.
   capability owned by `capability-owner`.
 - `expiry = 00` means that the delegation has no expiry time.
 - `expiry = 01 || t` means that the delegation is valid through Unix timestamp
-  `t`, in whole seconds. In other words, it is valid when `now <= t` and
-  expired when `now > t`.
+  `t`, in whole seconds. Evaluation truncates the current time to whole seconds
+  since the Unix epoch. It is valid when `floor(now) <= t` and expired when
+  `floor(now) > t`.
 - `capability` is an opaque sequence of bytes. It MAY be empty at the envelope
   layer.
 
@@ -123,10 +132,11 @@ signed-message = ASCII("rcan-2-delegation") || payload
 
 The version byte and signature itself are not part of `signed-message`.
 
-A verifier MUST verify the signature using `issuer`. Verifiers SHOULD use
-strict Ed25519 verification; the reference implementation uses
-`ed25519-dalek`'s `verify_strict`, which rejects non-canonical signatures and
-small-order components.
+A verifier MUST verify the signature using `issuer` with the strict semantics
+of `ed25519-dalek` 3.0.0's `verify_strict`. This requires a canonical scalar
+`S`, requires `R` to decompress, rejects a small-order `R` or issuer key, and
+requires the recomputed canonical `R` encoding to equal the 32 signature bytes
+exactly. These rules are part of the format, not an optional hardening measure.
 
 ## 5. Canonical decoding
 
@@ -181,10 +191,10 @@ When serialized through a human-readable data model, a delegation is its text
 form as a string.
 
 When serialized through a binary data model, a delegation is the complete wire
-form as a byte sequence, rather than a nested serialization of its fields. Any
-length prefix or byte-container framing belongs to the enclosing format. For
-example, postcard serializes that byte sequence with its normal vector length
-prefix.
+form as a native byte string, rather than a nested serialization of its fields
+or a sequence of integers. Any length prefix or byte-string framing belongs to
+the enclosing format. For example, postcard adds its normal byte-string length
+prefix, while CBOR uses major type 2.
 
 Deserialization from either representation MUST run all structural,
 canonicality, key, and signature checks above. A typed deserializer MUST also
