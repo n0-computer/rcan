@@ -669,7 +669,7 @@ impl Serialize for OpaqueDelegation {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
         } else {
-            self.encode().serialize(serializer)
+            serializer.serialize_bytes(&self.encode())
         }
     }
 }
@@ -682,10 +682,42 @@ impl<'de> Deserialize<'de> for OpaqueDelegation {
             let s = String::deserialize(deserializer)?;
             Self::decode_string(&s).map_err(D::Error::custom)
         } else {
-            let v = Vec::<u8>::deserialize(deserializer)?;
-            Self::decode(&v).map_err(D::Error::custom)
+            let bytes = deserialize_byte_buf(deserializer)?;
+            Self::decode(&bytes).map_err(D::Error::custom)
         }
     }
+}
+
+/// Deserialize an owned byte buffer without requiring `serde_bytes`.
+fn deserialize_byte_buf<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    struct ByteBufVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ByteBufVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a byte string")
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+            Ok(bytes.to_vec())
+        }
+
+        fn visit_borrowed_bytes<E: serde::de::Error>(
+            self,
+            bytes: &'de [u8],
+        ) -> Result<Self::Value, E> {
+            Ok(bytes.to_vec())
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
+            Ok(bytes)
+        }
+    }
+
+    deserializer.deserialize_byte_buf(ByteBufVisitor)
 }
 
 /// Forward all serialization of `Delegation<C>` to [`OpaqueDelegation`].

@@ -124,9 +124,11 @@ fn string_snapshots() {
 #[test]
 fn serde_delegates_to_encode() {
     let v2 = delegation();
+    let encoded = hexdump(V2_POSTCARD);
 
     let wire = postcard::to_stdvec(&v2).unwrap();
-    assert_eq!(wire, postcard::to_stdvec(&v2.encode()).unwrap());
+    let postcard_expected = [vec![0x8a, 0x01], encoded.clone()].concat();
+    assert_eq!(wire, postcard_expected);
     assert_eq!(postcard::from_bytes::<Delegation<Rpc>>(&wire).unwrap(), v2);
     assert_eq!(postcard::to_stdvec(v2.opaque()).unwrap(), wire);
     assert_eq!(
@@ -136,13 +138,16 @@ fn serde_delegates_to_encode() {
 
     let mut cbor = Vec::new();
     ciborium::into_writer(&v2, &mut cbor).unwrap();
-    let mut expected = Vec::new();
-    ciborium::into_writer(&v2.encode(), &mut expected).unwrap();
-    assert_eq!(cbor, expected);
+    let cbor_expected = [vec![0x58, 0x8a], encoded.clone()].concat();
+    assert_eq!(cbor, cbor_expected);
     assert_eq!(
         ciborium::from_reader::<Delegation<Rpc>, _>(&cbor[..]).unwrap(),
         v2
     );
+
+    let mut cbor_array = Vec::new();
+    ciborium::into_writer(&encoded, &mut cbor_array).unwrap();
+    assert!(ciborium::from_reader::<Delegation<Rpc>, _>(&cbor_array[..]).is_err());
 
     let quoted = serde_json::to_string(&v2.encode_string()).unwrap();
     assert_eq!(serde_json::to_string(&v2).unwrap(), quoted);
