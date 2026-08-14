@@ -272,7 +272,6 @@ pub struct Delegation<C> {
 }
 
 impl<C> Delegation<C> {
-    /// Constructs a new delegation from its parts.
     fn new(
         issuer: VerifyingKey,
         audience: VerifyingKey,
@@ -388,15 +387,14 @@ impl<C: CapabilityEncoding> Delegation<C> {
     }
 }
 
-/// Decodes a v2 delegation, verifying the signature and canonical encoding and
-/// that the capability decodes as `C`.
 fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C>, DecodeError> {
     if bytes.len() < SIGNATURE_LENGTH {
         return Err(DecodeError::malformed("invalid signature length"));
     }
     let (body_bytes, sig_bytes) = bytes.split_at(bytes.len() - SIGNATURE_LENGTH);
-    let (delegation, used) = decode_body::<C>(body_bytes)?;
-    if used != body_bytes.len() {
+    let mut body = body_bytes;
+    let delegation = decode_body::<C>(&mut body)?;
+    if !body.is_empty() {
         return Err(DecodeError::malformed("non canonical encoding of payload"));
     }
     let signature = Signature::from_bytes(
@@ -551,7 +549,6 @@ pub enum DecodeError {
 }
 
 impl DecodeError {
-    /// Returns a `Malformed` error for the given `reason`.
     fn malformed(reason: impl std::fmt::Display) -> Self {
         e!(DecodeError::Malformed {
             reason: reason.to_string()
@@ -649,75 +646,66 @@ fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<
     out.extend_from_slice(&capability);
 }
 
-/// Decodes a delegation's payload from its canonical byte representation,
-/// returning it along with the number of bytes consumed. The capability is
-/// decoded as `C`, and the signature field is left empty.
-fn decode_body<C: CapabilityEncoding>(bytes: &[u8]) -> Result<(Delegation<C>, usize), DecodeError> {
-    let mut cursor = 0usize;
-    macro_rules! take {
-        ($n:expr) => {{
-            let end = cursor
-                .checked_add($n)
-                .ok_or_else(|| DecodeError::malformed("payload length overflow"))?;
-            let slice = bytes
-                .get(cursor..end)
-                .ok_or_else(|| DecodeError::malformed("payload is truncated"))?;
-            cursor = end;
-            slice
-        }};
-    }
-    macro_rules! take_u64 {
-        () => {{
-            let (value, consumed) = bijoux::u64::decode(&bytes[cursor..])
-                .map_err(|e| DecodeError::malformed(format!("invalid varint: {e}")))?;
-            cursor += consumed;
-            value
-        }};
-    }
+fn take_bytes<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], DecodeError> {
+    let (head, rest) = buf
+        .split_at_checked(n)
+        .ok_or_else(|| DecodeError::malformed("payload is truncated"))?;
+    *buf = rest;
+    Ok(head)
+}
 
-    let issuer = VerifyingKey::from_bytes(take!(32).try_into().expect("32 bytes"))
-        .map_err(|_| DecodeError::malformed("invalid issuer"))?;
-    let audience = VerifyingKey::from_bytes(take!(32).try_into().expect("32 bytes"))
-        .map_err(|_| DecodeError::malformed("invalid audience"))?;
-    let capability_origin = match take_u64!() {
+fn take_chunk<'a, const N: usize>(buf: &mut &'a [u8]) -> Result<&'a [u8; N], DecodeError> {
+    let Some((head, rest)) = buf.split_first_chunk() else {
+        return Err(DecodeError::malformed("payload is truncated"));
+    };
+    *buf = rest;
+    Ok(head)
+}
+
+fn take_key(buf: &mut &[u8]) -> Result<VerifyingKey, DecodeError> {
+    let bytes = take_chunk::<32>(buf)?;
+    VerifyingKey::from_bytes(bytes).map_err(|_| DecodeError::malformed("invalid key"))
+}
+
+fn take_u64(buf: &mut &[u8]) -> Result<u64, DecodeError> {
+    let (value, consumed) = bijoux::u64::decode(buf)
+        .map_err(|e| DecodeError::malformed(format!("invalid varint: {e}")))?;
+    *buf = &buf[consumed..];
+    Ok(value)
+}
+
+fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, DecodeError> {
+    let issuer = take_key(buf)?;
+    let audience = take_key(buf)?;
+    let capability_origin = match take_u64(buf)? {
         0 => CapabilityOrigin::Issuer,
-        1 => {
-            let root = VerifyingKey::from_bytes(take!(32).try_into().expect("32 bytes"))
-                .map_err(|_| DecodeError::malformed("invalid capability origin"))?;
-            CapabilityOrigin::Delegation(root)
-        }
+        1 => CapabilityOrigin::Delegation(take_key(buf)?),
         tag => {
             return Err(DecodeError::malformed(format!(
                 "unknown capability origin tag {tag}"
             )))
         }
     };
-    let valid_until = match take_u64!() {
+    let valid_until = match take_u64(buf)? {
         0 => Expires::Never,
-        1 => Expires::At(take_u64!()),
+        1 => Expires::At(take_u64(buf)?),
         tag => return Err(DecodeError::malformed(format!("unknown expires tag {tag}"))),
     };
-    let cap_len = usize::try_from(take_u64!())
+    let cap_len = usize::try_from(take_u64(buf)?)
         .map_err(|_| DecodeError::malformed("capability length overflow"))?;
-    let cap_bytes = take!(cap_len);
+    let cap_bytes = take_bytes(buf, cap_len)?;
     let capability = C::decode(cap_bytes)?;
 
-    Ok((
-        Delegation::new(
-            issuer,
-            audience,
-            capability_origin,
-            valid_until,
-            capability,
-            Signature::from_bytes(&[0u8; 64]),
-        ),
-        cursor,
+    Ok(Delegation::new(
+        issuer,
+        audience,
+        capability_origin,
+        valid_until,
+        capability,
+        Signature::from_bytes(&[0u8; 64]),
     ))
 }
 
-/// Decodes a string as case insensitive base32, returning the bytes.
-///
-/// If the string is not valid base32, returns a [`DecodeError::Malformed`] error.
 fn base32_bytes(s: &str) -> Result<Vec<u8>, DecodeError> {
     data_encoding::BASE32_NOPAD
         .decode(s.to_ascii_uppercase().as_bytes())
