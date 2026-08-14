@@ -69,26 +69,26 @@ pub trait Capability: CapabilityEncoding {
 
 /// The authority that verifies an invocation.
 ///
-/// An [`Authorizer`] holds the public key of the identity that first issued a
+/// An [`Authorizer`] holds the public key of the principal that first issued a
 /// capability. `check_invocation_from` verifies that an invocation is backed by
-/// an unexpired, unbroken chain of delegations originating from that identity.
+/// an unexpired, unbroken chain of delegations originating from that principal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Authorizer {
-    identity: VerifyingKey,
+    principal: VerifyingKey,
 }
 
 #[allow(clippy::result_large_err)]
 impl Authorizer {
-    /// Returns an authorizer for the given verifying key.
-    pub fn new(identity: VerifyingKey) -> Self {
-        Self { identity }
+    /// Returns an authorizer for the given principal.
+    pub fn new(principal: VerifyingKey) -> Self {
+        Self { principal }
     }
 
     /// Verifies an invocation of `capability` by `invoker`, backed by
     /// `proof_chain`.
     ///
     /// The chain must start with the delegation issued by this authorizer's
-    /// identity and end at `invoker`. Make sure the invoker signed and
+    /// principal and end at `invoker`. Make sure the invoker signed and
     /// authenticated the message carrying `capability`; this method only
     /// checks the capability chain itself.
     ///
@@ -144,7 +144,7 @@ impl Authorizer {
     ) -> Result<(), InvocationError> {
         // The chain is checked back-to-front: it starts at the owner of the
         // capability and each delegation names the next issuer.
-        let mut current_issuer = &self.identity;
+        let mut current_issuer = &self.principal;
         for proof in proof_chain {
             if proof.issuer() != current_issuer {
                 return Err(e!(InvocationError::ChainBroken {
@@ -157,9 +157,9 @@ impl Authorizer {
                     expiry: proof.expires().clone(),
                 }));
             }
-            if proof.capability_owner() != &self.identity {
-                return Err(e!(InvocationError::WrongCapabilityOwner {
-                    authorizer: self.identity,
+            if proof.capability_owner() != &self.principal {
+                return Err(e!(InvocationError::CapabilityOwnerMismatch {
+                    authorizer: self.principal,
                 }));
             }
             if !proof.capability().permits(&capability) {
@@ -168,7 +168,7 @@ impl Authorizer {
             current_issuer = proof.audience();
         }
         if &invoker != current_issuer {
-            return Err(e!(InvocationError::WrongInvoker {
+            return Err(e!(InvocationError::InvokerMismatch {
                 invoker,
                 chain_end: *current_issuer,
             }));
@@ -296,12 +296,12 @@ impl<C> Delegation<C> {
         &self.signature
     }
 
-    /// Returns the issuing identity.
+    /// Returns the public key of the issuing principal.
     pub fn issuer(&self) -> &VerifyingKey {
         &self.issuer
     }
 
-    /// Returns the identity this delegation was granted to.
+    /// Returns the public key of the principal this delegation was granted to.
     pub fn audience(&self) -> &VerifyingKey {
         &self.audience
     }
@@ -311,7 +311,7 @@ impl<C> Delegation<C> {
         &self.capability_origin
     }
 
-    /// Returns the identity that owns the capability.
+    /// Returns the public key of the principal that owns the capability.
     pub fn capability_owner(&self) -> &VerifyingKey {
         match &self.capability_origin {
             CapabilityOrigin::Issuer => &self.issuer,
@@ -325,9 +325,6 @@ impl<C> Delegation<C> {
     }
 
     /// Returns the stored capability by reference.
-    ///
-    /// Borrowing lets an [`OpaqueDelegation`]'s bytes be read without cloning,
-    /// e.g. `delegation.capability().as_bytes()`.
     pub fn capability(&self) -> &C {
         &self.capability
     }
@@ -429,9 +426,9 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
 /// Where a delegated capability comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CapabilityOrigin {
-    /// The capability originates with the delegating identity itself.
+    /// The capability originates with the delegating principal itself.
     Issuer,
-    /// The capability was previously granted by this root identity.
+    /// The capability was previously granted by this root principal.
     Delegation(VerifyingKey),
 }
 
@@ -541,8 +538,9 @@ pub enum DecodeError {
     /// The input is malformed, with a reason.
     #[error("malformed token: {reason}")]
     Malformed { reason: String },
-    /// The input is a version-1 (legacy) token; use rcan 0.4.x to read those.
-    #[error("v1 tokens are not supported, use rcan 0.4.x to read them")]
+    /// The input is a legacy version-1 token, which this crate does not read.
+    /// Re-encode it with an older rcan client first.
+    #[error("rcan delegation version 1 not supported")]
     UnsupportedV1,
     /// The token's signature is invalid.
     #[error("signature verification failed")]
@@ -566,7 +564,7 @@ impl DecodeError {
 #[non_exhaustive]
 pub enum InvocationError {
     /// The proof chain is broken: a delegation was issued by a different
-    /// identity than the previous delegation was granted to.
+    /// principal than the previous delegation was granted to.
     #[error(
         "expected proof to be issued by {}, but was issued by {}",
         hex::encode(expected),
@@ -583,8 +581,8 @@ pub enum InvocationError {
         "proof is missing delegation for capability of {}",
         hex::encode(authorizer)
     )]
-    /// A delegation in the chain does not convey the authorizer's capability.
-    WrongCapabilityOwner { authorizer: VerifyingKey },
+    /// A delegation in the chain delegates a capability from a different owner.
+    CapabilityOwnerMismatch { authorizer: VerifyingKey },
     /// No delegation in the chain permits the requested capability.
     #[error("capability not permitted")]
     NotPermitted,
@@ -594,7 +592,7 @@ pub enum InvocationError {
         hex::encode(chain_end)
     )]
     /// The final audience in the chain does not match the invoker.
-    WrongInvoker {
+    InvokerMismatch {
         invoker: VerifyingKey,
         chain_end: VerifyingKey,
     },

@@ -275,7 +275,7 @@ fn two_link_chain_invocation() {
     let err = authorizer
         .check_invocation_from_at(now, key(3).verifying_key(), Rpc::Read, &chain)
         .unwrap_err();
-    assert_matches!(&err, InvocationError::WrongInvoker { invoker, chain_end, .. }
+    assert_matches!(&err, InvocationError::InvokerMismatch { invoker, chain_end, .. }
         if invoker == &key(3).verifying_key() && chain_end == &bob.verifying_key());
     let late = SystemTime::UNIX_EPOCH + Duration::from_secs(4_102_444_801);
     let err = authorizer
@@ -339,7 +339,7 @@ fn subject_must_be_the_authorizer() {
     let err = authorizer
         .check_invocation_from(alice.verifying_key(), Rpc::Read, &[&foreign_grant])
         .unwrap_err();
-    assert_matches!(&err, InvocationError::WrongCapabilityOwner { authorizer, .. }
+    assert_matches!(&err, InvocationError::CapabilityOwnerMismatch { authorizer, .. }
         if authorizer == &service.verifying_key());
 }
 
@@ -353,6 +353,6 @@ fn owner_needs_no_chain() {
     let err = authorizer
         .check_invocation_from::<Rpc>(key(1).verifying_key(), Rpc::Read, &[])
         .unwrap_err();
-    assert_matches!(&err, InvocationError::WrongInvoker { invoker, chain_end, .. }
+    assert_matches!(&err, InvocationError::InvokerMismatch { invoker, chain_end, .. }
         if invoker == &key(1).verifying_key() && chain_end == &service.verifying_key());
 }
