@@ -162,7 +162,7 @@ impl Authorizer {
                     authorizer: self.identity,
                 }));
             }
-            if !proof.capability_ref().permits(&capability) {
+            if !proof.capability().permits(&capability) {
                 return Err(e!(InvocationError::NotPermitted));
             }
             current_issuer = proof.audience();
@@ -324,17 +324,12 @@ impl<C> Delegation<C> {
         &self.valid_until
     }
 
-    /// Returns the stored capability, without cloning. Crate-internal; the
-    /// public [`capability`](Self::capability) returns an owned copy.
-    pub(crate) fn capability_ref(&self) -> &C {
+    /// Returns the stored capability by reference.
+    ///
+    /// Borrowing lets an [`OpaqueDelegation`]'s bytes be read without cloning,
+    /// e.g. `delegation.capability().as_bytes()`.
+    pub fn capability(&self) -> &C {
         &self.capability
-    }
-}
-
-impl<C: Clone> Delegation<C> {
-    /// Returns a copy of the stored capability.
-    pub fn capability(&self) -> C {
-        self.capability.clone()
     }
 }
 
