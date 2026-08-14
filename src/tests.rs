@@ -86,7 +86,7 @@ fn wire_snapshots() {
     assert_eq!(v2.issuer(), &key(0).verifying_key());
     assert_eq!(v2.audience(), &key(1).verifying_key());
     assert_eq!(v2.expires(), &Expires::At(4_102_444_800));
-    assert_eq!(v2.capability_issuer(), &key(0).verifying_key());
+    assert_eq!(v2.capability_owner(), &key(0).verifying_key());
     assert_eq!(v2.capability(), Rpc::ReadWrite);
 
     let never = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
@@ -339,7 +339,7 @@ fn subject_must_be_the_authorizer() {
     let err = authorizer
         .check_invocation_from(alice.verifying_key(), Rpc::Read, &[&foreign_grant])
         .unwrap_err();
-    assert_matches!(&err, InvocationError::WrongCapabilityIssuer { authorizer, .. }
+    assert_matches!(&err, InvocationError::WrongCapabilityOwner { authorizer, .. }
         if authorizer == &service.verifying_key());
 }
 

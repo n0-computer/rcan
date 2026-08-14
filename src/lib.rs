@@ -157,12 +157,12 @@ impl Authorizer {
                     expiry: proof.expires().clone(),
                 }));
             }
-            if proof.capability_issuer() != &self.identity {
-                return Err(e!(InvocationError::WrongCapabilityIssuer {
+            if proof.capability_owner() != &self.identity {
+                return Err(e!(InvocationError::WrongCapabilityOwner {
                     authorizer: self.identity,
                 }));
             }
-            if !proof.payload().capability().permits(&capability) {
+            if !proof.capability_ref().permits(&capability) {
                 return Err(e!(InvocationError::NotPermitted));
             }
             current_issuer = proof.audience();
@@ -240,15 +240,13 @@ impl Delegation<OpaqueCapability> {
     /// let back: Delegation<Cap> = opaque.parse().unwrap();
     /// ```
     pub fn parse<C: CapabilityEncoding>(self) -> Result<Delegation<C>, DecodeError> {
-        let capability = C::decode(self.payload.capability.as_bytes())?;
+        let capability = C::decode(self.capability.as_bytes())?;
         Ok(Delegation::new(
-            Payload {
-                issuer: self.payload.issuer,
-                audience: self.payload.audience,
-                capability_origin: self.payload.capability_origin,
-                valid_until: self.payload.valid_until,
-                capability,
-            },
+            self.issuer,
+            self.audience,
+            self.capability_origin,
+            self.valid_until,
+            capability,
             self.signature,
         ))
     }
@@ -265,19 +263,32 @@ impl Delegation<OpaqueCapability> {
 /// turned into a typed `Delegation<C>` with [`parse`](OpaqueDelegation::parse).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delegation<C> {
-    payload: Payload<C>,
+    issuer: VerifyingKey,
+    audience: VerifyingKey,
+    capability_origin: CapabilityOrigin,
+    valid_until: Expires,
+    capability: C,
     signature: Signature,
 }
 
 impl<C> Delegation<C> {
-    /// Constructs a new delegation from a payload and signature.
-    fn new(payload: Payload<C>, signature: Signature) -> Self {
-        Self { payload, signature }
-    }
-
-    /// Returns the delegation's payload.
-    pub fn payload(&self) -> &Payload<C> {
-        &self.payload
+    /// Constructs a new delegation from its parts.
+    fn new(
+        issuer: VerifyingKey,
+        audience: VerifyingKey,
+        capability_origin: CapabilityOrigin,
+        valid_until: Expires,
+        capability: C,
+        signature: Signature,
+    ) -> Self {
+        Self {
+            issuer,
+            audience,
+            capability_origin,
+            valid_until,
+            capability,
+            signature,
+        }
     }
 
     /// Returns the delegation's signature.
@@ -287,34 +298,43 @@ impl<C> Delegation<C> {
 
     /// Returns the issuing identity.
     pub fn issuer(&self) -> &VerifyingKey {
-        self.payload.issuer()
+        &self.issuer
     }
 
     /// Returns the identity this delegation was granted to.
     pub fn audience(&self) -> &VerifyingKey {
-        self.payload.audience()
+        &self.audience
     }
 
     /// Returns the origin of the delegated capability.
     pub fn capability_origin(&self) -> &CapabilityOrigin {
-        self.payload.capability_origin()
+        &self.capability_origin
     }
 
-    /// Returns the identity that originally held the capability.
-    pub fn capability_issuer(&self) -> &VerifyingKey {
-        self.payload.capability_issuer()
+    /// Returns the identity that owns the capability.
+    pub fn capability_owner(&self) -> &VerifyingKey {
+        match &self.capability_origin {
+            CapabilityOrigin::Issuer => &self.issuer,
+            CapabilityOrigin::Delegation(root) => root,
+        }
     }
 
     /// Returns when this delegation expires.
     pub fn expires(&self) -> &Expires {
-        self.payload.expires()
+        &self.valid_until
+    }
+
+    /// Returns the stored capability, without cloning. Crate-internal; the
+    /// public [`capability`](Self::capability) returns an owned copy.
+    pub(crate) fn capability_ref(&self) -> &C {
+        &self.capability
     }
 }
 
 impl<C: Clone> Delegation<C> {
     /// Returns a copy of the stored capability.
     pub fn capability(&self) -> C {
-        self.payload.capability().clone()
+        self.capability.clone()
     }
 }
 
@@ -322,15 +342,12 @@ impl<C: CapabilityEncoding> Delegation<C> {
     /// Turns this delegation into an [`OpaqueDelegation`], encoding the
     /// capability to bytes.
     pub fn into_opaque(self) -> OpaqueDelegation {
-        let encoded = C::encode(&self.payload.capability);
         OpaqueDelegation::new(
-            Payload {
-                issuer: self.payload.issuer,
-                audience: self.payload.audience,
-                capability_origin: self.payload.capability_origin,
-                valid_until: self.payload.valid_until,
-                capability: OpaqueCapability(encoded),
-            },
+            self.issuer,
+            self.audience,
+            self.capability_origin,
+            self.valid_until,
+            OpaqueCapability(C::encode(&self.capability)),
             self.signature,
         )
     }
@@ -338,7 +355,7 @@ impl<C: CapabilityEncoding> Delegation<C> {
     /// Returns the delegation's byte encoding.
     pub fn encode(&self) -> Vec<u8> {
         let mut res = vec![2u8];
-        encode_payload(&self.payload, &mut res);
+        encode_body(self, &mut res);
         res.extend_from_slice(&self.signature.to_bytes());
         res
     }
@@ -385,9 +402,9 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
     if bytes.len() < SIGNATURE_LENGTH {
         return Err(DecodeError::malformed("invalid signature length"));
     }
-    let (payload_bytes, sig_bytes) = bytes.split_at(bytes.len() - SIGNATURE_LENGTH);
-    let (payload, used) = decode_payload::<C>(payload_bytes)?;
-    if used != payload_bytes.len() {
+    let (body_bytes, sig_bytes) = bytes.split_at(bytes.len() - SIGNATURE_LENGTH);
+    let (delegation, used) = decode_body::<C>(body_bytes)?;
+    if used != body_bytes.len() {
         return Err(DecodeError::malformed("non canonical encoding of payload"));
     }
     let signature = Signature::from_bytes(
@@ -396,66 +413,22 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
             .map_err(|_| DecodeError::malformed("invalid signature length"))?,
     );
     let mut to_verify = DST.to_vec();
-    encode_payload::<C>(&payload, &mut to_verify);
-    if to_verify[DST.len()..] != *payload_bytes {
+    encode_body::<C>(&delegation, &mut to_verify);
+    if to_verify[DST.len()..] != *body_bytes {
         return Err(DecodeError::malformed("non canonical encoding of payload"));
     }
-    payload
+    delegation
         .issuer
         .verify_strict(&to_verify, &signature)
         .map_err(|_| e!(DecodeError::InvalidSignature))?;
-    Ok(Delegation::new(payload, signature))
-}
-
-/// The signed contents of a [`Delegation`]: the parties, the capability, and
-/// its expiry. Prefer the accessors on [`Delegation`] over this type directly.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Payload<C> {
-    /// The issuing identity
-    issuer: VerifyingKey,
-    /// The intended audience
-    audience: VerifyingKey,
-    /// The origin of the capability
-    capability_origin: CapabilityOrigin,
-    /// When the delegation expires
-    valid_until: Expires,
-    /// The capability
-    capability: C,
-}
-
-impl<C> Payload<C> {
-    /// Returns the issuing identity.
-    pub fn issuer(&self) -> &VerifyingKey {
-        &self.issuer
-    }
-
-    /// Returns the identity this delegation was granted to.
-    pub fn audience(&self) -> &VerifyingKey {
-        &self.audience
-    }
-
-    /// Returns the origin of the delegated capability.
-    pub fn capability_origin(&self) -> &CapabilityOrigin {
-        &self.capability_origin
-    }
-
-    /// Returns the identity that originally held the capability.
-    pub fn capability_issuer(&self) -> &VerifyingKey {
-        match &self.capability_origin {
-            CapabilityOrigin::Issuer => &self.issuer,
-            CapabilityOrigin::Delegation(root) => root,
-        }
-    }
-
-    /// Returns when this payload expires.
-    pub fn expires(&self) -> &Expires {
-        &self.valid_until
-    }
-
-    /// Returns the capability.
-    pub fn capability(&self) -> &C {
-        &self.capability
-    }
+    Ok(Delegation::new(
+        delegation.issuer,
+        delegation.audience,
+        delegation.capability_origin,
+        delegation.valid_until,
+        delegation.capability,
+        signature,
+    ))
 }
 
 /// Where a delegated capability comes from.
@@ -548,17 +521,21 @@ impl<C: CapabilityEncoding + Clone> DelegationBuilder<'_, C> {
     /// Signs the delegation, returning a [`Delegation<C>`] valid until
     /// `valid_until`.
     pub fn sign(self, valid_until: Expires) -> Delegation<C> {
-        let payload = Payload {
-            issuer: self.issuer.verifying_key(),
-            audience: self.audience,
-            capability_origin: self.capability_origin,
+        let delegation = Delegation::new(
+            self.issuer.verifying_key(),
+            self.audience,
+            self.capability_origin,
             valid_until,
-            capability: self.capability,
-        };
+            self.capability,
+            Signature::from_bytes(&[0u8; 64]),
+        );
         let mut to_sign = DST.to_vec();
-        encode_payload(&payload, &mut to_sign);
+        encode_body(&delegation, &mut to_sign);
         let signature = self.issuer.sign(&to_sign);
-        Delegation::new(payload, signature)
+        Delegation {
+            signature,
+            ..delegation
+        }
     }
 }
 
@@ -612,7 +589,7 @@ pub enum InvocationError {
         hex::encode(authorizer)
     )]
     /// A delegation in the chain does not convey the authorizer's capability.
-    WrongCapabilityIssuer { authorizer: VerifyingKey },
+    WrongCapabilityOwner { authorizer: VerifyingKey },
     /// No delegation in the chain permits the requested capability.
     #[error("capability not permitted")]
     NotPermitted,
@@ -655,33 +632,34 @@ impl<'de, C: CapabilityEncoding> Deserialize<'de> for Delegation<C> {
     }
 }
 
-/// Encodes the payload into its canonical byte representation (the part of the
-/// wire format that gets signed, without the leading version byte).
-fn encode_payload<C: CapabilityEncoding>(payload: &Payload<C>, out: &mut Vec<u8>) {
-    out.extend_from_slice(payload.issuer.as_bytes());
-    out.extend_from_slice(payload.audience.as_bytes());
-    match &payload.capability_origin {
+/// Encodes a delegation's payload (everything except its signature) into the
+/// canonical byte representation that gets signed.
+fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<u8>) {
+    out.extend_from_slice(delegation.issuer.as_bytes());
+    out.extend_from_slice(delegation.audience.as_bytes());
+    match &delegation.capability_origin {
         CapabilityOrigin::Issuer => bijoux::u64::encode(0, out),
         CapabilityOrigin::Delegation(root) => {
             bijoux::u64::encode(1, out);
             out.extend_from_slice(root.as_bytes());
         }
     }
-    match &payload.valid_until {
+    match &delegation.valid_until {
         Expires::Never => bijoux::u64::encode(0, out),
         Expires::At(t) => {
             bijoux::u64::encode(1, out);
             bijoux::u64::encode(*t, out);
         }
     }
-    let capability = C::encode(&payload.capability);
+    let capability = C::encode(&delegation.capability);
     bijoux::u64::encode(capability.len() as u64, out);
     out.extend_from_slice(&capability);
 }
 
-/// Decodes a payload from its canonical byte representation, returning it along
-/// with the number of bytes consumed. The capability is decoded as `C`.
-fn decode_payload<C: CapabilityEncoding>(bytes: &[u8]) -> Result<(Payload<C>, usize), DecodeError> {
+/// Decodes a delegation's payload from its canonical byte representation,
+/// returning it along with the number of bytes consumed. The capability is
+/// decoded as `C`, and the signature field is left empty.
+fn decode_body<C: CapabilityEncoding>(bytes: &[u8]) -> Result<(Delegation<C>, usize), DecodeError> {
     let mut cursor = 0usize;
     macro_rules! take {
         ($n:expr) => {{
@@ -732,13 +710,14 @@ fn decode_payload<C: CapabilityEncoding>(bytes: &[u8]) -> Result<(Payload<C>, us
     let capability = C::decode(cap_bytes)?;
 
     Ok((
-        Payload {
+        Delegation::new(
             issuer,
             audience,
             capability_origin,
             valid_until,
             capability,
-        },
+            Signature::from_bytes(&[0u8; 64]),
+        ),
         cursor,
     ))
 }
