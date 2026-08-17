@@ -54,10 +54,10 @@ const V2_POSTCARD: &str = "
     3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 // issuer: key(0)
     8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c // audience: key(1)
     00                                                               // capability origin: issuer
-    01 fbf3855508                                                    // valid until: at 4102444800
+    01 80ae99a40f                                                    // valid until: at 4102444800
     01 01                                                            // capability: 1 byte, Rpc::ReadWrite
-    fa8d3857bc29bc65c572a30f9bc603ad1b62a9fc4ebb37655e70b08f1d1e4037 // signature (v2 DST)
-    cf93f613d9cd0a76069dcefce0b92be3bc1d58852e85091eba1065882c824705
+    83461886f14cdfa8b2d60eaab3ce00098761aa2bbf8dd028820fd54211bf2cca // signature
+    ccfc635242760b1c1d0d1d1c98943556f725c1e2c7edcd94365660e5af929f06
 ";
 
 const V2_NEVER: &str = "
@@ -71,7 +71,7 @@ const V2_NEVER: &str = "
     7e2d4944846a0689ad5c6f89f9cff7283836f78633dd95e896aaa73fd28a490e
 ";
 
-const V2_STRING: &str = "ai5wuj54z23killcuounaktpbvzwkmqvo4o6eq5ghlaerimllhnctcui4poxicprsx6vfwznhs5f24wkm4e36hmucin7g5eiag2a6324aaa7x44fkueacap2ru4fppbjxrs4k4vdb6n4ma5ndnrkt7coxm3wkxtqwchr2hsag7hzh5qt3hgqu5qgtxhpzyfzfpr3yhkyquxikci6xiiglcbmqjdqk";
+const V2_STRING: &str = "ai5wuj54z23killcuounaktpbvzwkmqvo4o6eq5ghlaerimllhnctcui4poxicprsx6vfwznhs5f24wkm4e36hmucin7g5eiag2a6324aaaybluzuqhqcamdiymin4km36ulfvqovkz44aajq5q2uk57rxicraqp2vbbdpzmzlgpyy2sij3awha5buorzgeugvlpojob4ld63tmugzlgbznpskpqm";
 
 #[test]
 fn wire_snapshots() {
@@ -191,12 +191,25 @@ fn v2_decode_rejects_tampering() {
     assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("empty"));
 }
 
-// Canonicality is enforced by construction: the payload uses bijoux varints,
-// which are bijective with exactly one encoding per value. There is no overlong
-// (non-canonical) varint form to reject, so there is no equivalent of the
-// previous postcard-varint `V2_NC_*` rejection test. Any structural truncation
-// or padding is still rejected as `DecodeError::Malformed`, covered by
-// `v2_decode_rejects_tampering`.
+#[test]
+fn rejects_non_canonical_varint() {
+    // The capability-origin field is at hex offset 130; replace its single-byte
+    // `00` (origin: issuer) with an overlong `80 00` (zero, continued). This is
+    // a valid postcard u64 but not canonical, so decode must reject it.
+    let good = delegation().encode();
+    let mut overlong = good.clone();
+    let origin_offset = 1 + 32 + 32;
+    overlong[origin_offset] = 0x80;
+    overlong.insert(origin_offset + 1, 0x00);
+    let err = Delegation::<Rpc>::decode(&overlong).unwrap_err();
+    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("non-canonical"));
+}
+
+// The delegation wire format encodes numeric fields as postcard varints.
+// postcard accepts overlong encodings (e.g. `0` as `0x80 0x00`), so `decode`
+// re-encodes and rejects non-canonical forms; see `rejects_non_canonical_varint`
+// below. Structural truncation or padding is rejected as `DecodeError::Malformed`,
+// covered by `v2_decode_rejects_tampering`.
 
 #[test]
 fn rejects_v1() {

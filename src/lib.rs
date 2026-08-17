@@ -595,21 +595,22 @@ fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<
     out.extend_from_slice(delegation.issuer.as_bytes());
     out.extend_from_slice(delegation.audience.as_bytes());
     match &delegation.capability_origin {
-        CapabilityOrigin::Issuer => bijoux::u64::encode(0, out),
+        // `0u64`/`1u64` as varints
+        CapabilityOrigin::Issuer => out.extend_from_slice(&postcard::to_stdvec(&0u64).unwrap()),
         CapabilityOrigin::Delegation(root) => {
-            bijoux::u64::encode(1, out);
+            out.extend_from_slice(&postcard::to_stdvec(&1u64).unwrap());
             out.extend_from_slice(root.as_bytes());
         }
     }
     match &delegation.valid_until {
-        Expires::Never => bijoux::u64::encode(0, out),
+        Expires::Never => out.extend_from_slice(&postcard::to_stdvec(&0u64).unwrap()),
         Expires::At(t) => {
-            bijoux::u64::encode(1, out);
-            bijoux::u64::encode(*t, out);
+            out.extend_from_slice(&postcard::to_stdvec(&1u64).unwrap());
+            out.extend_from_slice(&postcard::to_stdvec(t).unwrap());
         }
     }
     let capability = C::encode(&delegation.capability);
-    bijoux::u64::encode(capability.len() as u64, out);
+    out.extend_from_slice(&postcard::to_stdvec(&(capability.len() as u64)).unwrap());
     out.extend_from_slice(&capability);
 }
 
@@ -701,8 +702,16 @@ fn take_key(buf: &mut &[u8]) -> Result<VerifyingKey, DecodeError> {
 }
 
 fn take_u64(buf: &mut &[u8]) -> Result<u64, DecodeError> {
-    let (value, consumed) = bijoux::u64::decode(buf)
+    let before = *buf;
+    let (value, rest) = postcard::take_from_bytes::<u64>(buf)
         .map_err(|e| DecodeError::malformed(format!("invalid varint: {e}")))?;
-    *buf = &buf[consumed..];
+    let consumed = &before[..before.len() - rest.len()];
+    // postcard allows overlong varints (e.g. 0 as `0x80 0x00`); the delegation
+    // body requires the canonical encoding, so re-encode and compare.
+    let canonical = postcard::to_stdvec(&value).expect("u64 serializes");
+    if consumed != &canonical[..] {
+        return Err(DecodeError::malformed("non-canonical varint"));
+    }
+    *buf = rest;
     Ok(value)
 }
