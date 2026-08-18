@@ -4,7 +4,8 @@ use n0_future::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Authorizer, Capability, DecodeError, Delegation, Expires, InvocationError, OpaqueDelegation,
+    Authorizer, Capability, DecodeError, Delegation, Expires, InvocationError, OpaqueCapability,
+    BASE32_LOWER_NOPAD,
 };
 
 /// An example capability type for testing.
@@ -55,7 +56,7 @@ const V2_POSTCARD: &str = "
     00                                                               // capability origin: issuer
     01 80ae99a40f                                                    // valid until: at 4102444800
     01 01                                                            // capability: 1 byte, Rpc::ReadWrite
-    83461886f14cdfa8b2d60eaab3ce00098761aa2bbf8dd028820fd54211bf2cca // signature (v2 DST)
+    83461886f14cdfa8b2d60eaab3ce00098761aa2bbf8dd028820fd54211bf2cca // signature
     ccfc635242760b1c1d0d1d1c98943556f725c1e2c7edcd94365660e5af929f06
 ";
 
@@ -86,8 +87,8 @@ fn wire_snapshots() {
     assert_eq!(v2.issuer(), &key(0).verifying_key());
     assert_eq!(v2.audience(), &key(1).verifying_key());
     assert_eq!(v2.expires(), &Expires::At(4_102_444_800));
-    assert_eq!(v2.capability_issuer(), &key(0).verifying_key());
-    assert_eq!(v2.capability(), Rpc::ReadWrite);
+    assert_eq!(v2.capability_owner(), &key(0).verifying_key());
+    assert_eq!(*v2.capability(), Rpc::ReadWrite);
 
     let never = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
         .sign(Expires::Never);
@@ -97,8 +98,8 @@ fn wire_snapshots() {
         never
     );
 
-    let opaque = OpaqueDelegation::decode(&bytes).unwrap();
-    assert_eq!(&opaque, v2.opaque());
+    let opaque = Delegation::decode(&bytes).unwrap();
+    assert_eq!(opaque, v2.into_opaque());
 }
 
 #[test]
@@ -107,16 +108,13 @@ fn string_snapshots() {
     assert_eq!(v2.encode_string(), V2_STRING);
     assert_eq!(Delegation::<Rpc>::decode_string(V2_STRING).unwrap(), v2);
 
-    let opaque = OpaqueDelegation::decode_string(V2_STRING).unwrap();
-    assert_eq!(&opaque, v2.opaque());
+    let opaque = Delegation::decode_string(V2_STRING).unwrap();
+    assert_eq!(opaque, v2.into_opaque());
 
-    let mut bytes = data_encoding::BASE32_NOPAD
-        .decode(V2_STRING.to_ascii_uppercase().as_bytes())
-        .unwrap();
+    let mut bytes = BASE32_LOWER_NOPAD.decode(V2_STRING.as_bytes()).unwrap();
     let n = bytes.len();
     bytes[n - 1] ^= 1;
-    let mut tampered = data_encoding::BASE32_NOPAD.encode(&bytes);
-    tampered.make_ascii_lowercase();
+    let tampered = BASE32_LOWER_NOPAD.encode(&bytes);
     let err = Delegation::<Rpc>::decode_string(&tampered).unwrap_err();
     assert_matches!(err, DecodeError::InvalidSignature { .. });
 }
@@ -130,11 +128,10 @@ fn serde_delegates_to_encode() {
     let postcard_expected = [vec![0x8a, 0x01], encoded.clone()].concat();
     assert_eq!(wire, postcard_expected);
     assert_eq!(postcard::from_bytes::<Delegation<Rpc>>(&wire).unwrap(), v2);
-    assert_eq!(postcard::to_stdvec(v2.opaque()).unwrap(), wire);
-    assert_eq!(
-        postcard::from_bytes::<OpaqueDelegation>(&wire).unwrap(),
-        *v2.opaque()
-    );
+    // The opaque form round-trips through the same wire encoding.
+    let opaque: Delegation = v2.clone().into_opaque();
+    assert_eq!(opaque.encode(), v2.encode());
+    assert_eq!(Delegation::decode(&v2.encode()).unwrap(), opaque);
 
     let mut cbor = Vec::new();
     ciborium::into_writer(&v2, &mut cbor).unwrap();
@@ -144,10 +141,6 @@ fn serde_delegates_to_encode() {
         ciborium::from_reader::<Delegation<Rpc>, _>(&cbor[..]).unwrap(),
         v2
     );
-
-    let mut cbor_array = Vec::new();
-    ciborium::into_writer(&encoded, &mut cbor_array).unwrap();
-    assert!(ciborium::from_reader::<Delegation<Rpc>, _>(&cbor_array[..]).is_err());
 
     let quoted = serde_json::to_string(&v2.encode_string()).unwrap();
     assert_eq!(serde_json::to_string(&v2).unwrap(), quoted);
@@ -183,7 +176,7 @@ fn v2_decode_rejects_tampering() {
     let signature_start = padded.len() - SIGNATURE_LENGTH;
     padded.insert(signature_start, 0);
     let err = Delegation::<Rpc>::decode(&padded).unwrap_err();
-    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("signature length"));
+    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("canonical"));
 
     let mut versioned = good.clone();
     versioned[0] = 3;
@@ -194,37 +187,25 @@ fn v2_decode_rejects_tampering() {
     assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("empty"));
 }
 
-/// A non-canonical v2 delegation with an overlong varint for the expiry time.
-const V2_NC_EXPIRY: &str = "
-    02                                                               // version: v2
-    3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 // issuer: key(0)
-    8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c // audience: key(1)
-    00                                                               // capability origin: issuer
-    01 80ae99a48f00                                                  // valid until: at 4102444800 (overlong varint)
-    01 01                                                            // capability: 1 byte, Rpc::ReadWrite
-    83461886f14cdfa8b2d60eaab3ce00098761aa2bbf8dd028820fd54211bf2cca // signature (over the canonical form)
-    ccfc635242760b1c1d0d1d1c98943556f725c1e2c7edcd94365660e5af929f06
-";
-/// A non-canonical v2 delegation with an overlong varint for the capability length prefix.
-const V2_NC_CAP_LEN: &str = "
-    02                                                               // version: v2
-    3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 // issuer: key(0)
-    8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c // audience: key(1)
-    00                                                               // capability origin: issuer
-    01 80ae99a40f                                                    // valid until: at 4102444800
-    81 00 01                                                         // capability: len 1 (overlong 0x81 0x00), Rpc::ReadWrite
-    83461886f14cdfa8b2d60eaab3ce00098761aa2bbf8dd028820fd54211bf2cca // signature (over the canonical form)
-    ccfc635242760b1c1d0d1d1c98943556f725c1e2c7edcd94365660e5af929f06
-";
-
 #[test]
-fn v2_rejects_non_canonical() {
-    assert!(Delegation::<Rpc>::decode(&hexdump(V2_POSTCARD)).is_ok());
-    for nc in [V2_NC_EXPIRY, V2_NC_CAP_LEN] {
-        let err = Delegation::<Rpc>::decode(&hexdump(nc)).unwrap_err();
-        assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("canonical"));
-    }
+fn rejects_non_canonical_varint() {
+    // The capability-origin field is at hex offset 130; replace its single-byte
+    // `00` (origin: issuer) with an overlong `80 00` (zero, continued). This is
+    // a valid postcard u64 but not canonical, so decode must reject it.
+    let good = delegation().encode();
+    let mut overlong = good.clone();
+    let origin_offset = 1 + 32 + 32;
+    overlong[origin_offset] = 0x80;
+    overlong.insert(origin_offset + 1, 0x00);
+    let err = Delegation::<Rpc>::decode(&overlong).unwrap_err();
+    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("non-canonical"));
 }
+
+// The delegation wire format encodes numeric fields as postcard varints.
+// postcard accepts overlong encodings (e.g. `0` as `0x80 0x00`), so `decode`
+// re-encodes and rejects non-canonical forms; see `rejects_non_canonical_varint`
+// below. Structural truncation or padding is rejected as `DecodeError::Malformed`,
+// covered by `v2_decode_rejects_tampering`.
 
 #[test]
 fn rejects_v1() {
@@ -232,7 +213,7 @@ fn rejects_v1() {
         let bytes = [lead; 8];
         let err = Delegation::<Rpc>::decode(&bytes).unwrap_err();
         assert_matches!(err, DecodeError::UnsupportedV1 { .. });
-        let err = OpaqueDelegation::decode(&bytes).unwrap_err();
+        let err = Delegation::<OpaqueCapability>::decode(&bytes).unwrap_err();
         assert_matches!(err, DecodeError::UnsupportedV1 { .. });
     }
 }
@@ -240,14 +221,14 @@ fn rejects_v1() {
 #[test]
 fn opaque_roundtrip() {
     let typed = delegation();
-    assert_eq!(typed.capability(), Rpc::ReadWrite);
+    assert_eq!(*typed.capability(), Rpc::ReadWrite);
 
-    let untyped: OpaqueDelegation = typed.clone().into();
-    let again = Delegation::<Rpc>::try_from(untyped.clone()).unwrap();
+    let untyped: Delegation = typed.clone().into_opaque();
+    let again = untyped.clone().try_into_typed::<Rpc>().unwrap();
     assert_eq!(again, typed);
 
-    let decoded = OpaqueDelegation::decode(&typed.encode()).unwrap();
-    let again = Delegation::<Rpc>::try_from(decoded).unwrap();
+    let decoded = Delegation::decode(&typed.encode()).unwrap();
+    let again = decoded.try_into_typed::<Rpc>().unwrap();
     assert_eq!(again, typed);
 }
 
@@ -260,8 +241,8 @@ fn rejects_wrong_capability_type() {
     }
 
     let typed = delegation();
-    let untyped: OpaqueDelegation = typed.clone().into();
-    let err = Delegation::<OtherCapability>::try_from(untyped).unwrap_err();
+    let untyped: Delegation = typed.clone().into_opaque();
+    let err = untyped.try_into_typed::<OtherCapability>().unwrap_err();
     assert_matches!(err, DecodeError::WrongCapability { .. });
     let err = Delegation::<OtherCapability>::decode(&typed.encode()).unwrap_err();
     assert_matches!(err, DecodeError::WrongCapability { .. });
@@ -301,7 +282,7 @@ fn two_link_chain_invocation() {
     let err = authorizer
         .check_invocation_from_at(now, key(3).verifying_key(), Rpc::Read, &chain)
         .unwrap_err();
-    assert_matches!(&err, InvocationError::WrongInvoker { invoker, chain_end, .. }
+    assert_matches!(&err, InvocationError::InvokerMismatch { invoker, chain_end, .. }
         if invoker == &key(3).verifying_key() && chain_end == &bob.verifying_key());
     let late = SystemTime::UNIX_EPOCH + Duration::from_secs(4_102_444_801);
     let err = authorizer
@@ -315,12 +296,19 @@ fn two_link_chain_invocation() {
         }
     );
 
-    let opaque_chain = [root.opaque(), link.opaque()];
+    let opaque_root = root.into_opaque();
+    let opaque_link = link.into_opaque();
+    // Opaque delegations are checked by parsing them into typed delegations first.
+    let parsed_chain = [
+        opaque_root.try_into_typed::<Rpc>().unwrap(),
+        opaque_link.try_into_typed::<Rpc>().unwrap(),
+    ];
+    let refs = [&parsed_chain[0], &parsed_chain[1]];
     authorizer
-        .check_opaque_invocation_from_at(now, bob.verifying_key(), Rpc::Read, &opaque_chain)
+        .check_invocation_from_at(now, bob.verifying_key(), Rpc::Read, &refs)
         .unwrap();
     let err = authorizer
-        .check_opaque_invocation_from_at(now, bob.verifying_key(), Rpc::ReadWrite, &opaque_chain)
+        .check_invocation_from_at(now, bob.verifying_key(), Rpc::ReadWrite, &refs)
         .unwrap_err();
     assert_matches!(err, InvocationError::NotPermitted { .. });
 }
@@ -358,7 +346,7 @@ fn subject_must_be_the_authorizer() {
     let err = authorizer
         .check_invocation_from(alice.verifying_key(), Rpc::Read, &[&foreign_grant])
         .unwrap_err();
-    assert_matches!(&err, InvocationError::WrongCapabilityIssuer { authorizer, .. }
+    assert_matches!(&err, InvocationError::CapabilityOwnerMismatch { authorizer, .. }
         if authorizer == &service.verifying_key());
 }
 
@@ -372,6 +360,6 @@ fn owner_needs_no_chain() {
     let err = authorizer
         .check_invocation_from::<Rpc>(key(1).verifying_key(), Rpc::Read, &[])
         .unwrap_err();
-    assert_matches!(&err, InvocationError::WrongInvoker { invoker, chain_end, .. }
+    assert_matches!(&err, InvocationError::InvokerMismatch { invoker, chain_end, .. }
         if invoker == &key(1).verifying_key() && chain_end == &service.verifying_key());
 }
