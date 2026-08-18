@@ -207,7 +207,7 @@ impl<C: CapabilityEncoding> Serialize for Delegation<C> {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
         } else {
-            self.encode().serialize(serializer)
+            serializer.serialize_bytes(&self.encode())
         }
     }
 }

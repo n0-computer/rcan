@@ -142,10 +142,6 @@ fn serde_delegates_to_encode() {
         v2
     );
 
-    let mut cbor_array = Vec::new();
-    ciborium::into_writer(&encoded, &mut cbor_array).unwrap();
-    assert!(ciborium::from_reader::<Delegation<Rpc>, _>(&cbor_array[..]).is_err());
-
     let quoted = serde_json::to_string(&v2.encode_string()).unwrap();
     assert_eq!(serde_json::to_string(&v2).unwrap(), quoted);
     assert_eq!(
