@@ -112,7 +112,7 @@ impl<C> Delegation<C> {
     }
 }
 
-impl<C: CapabilityEncoding> Delegation<C> {
+impl<C> Delegation<C> {
     /// Turns this delegation into a `Delegation` with an opaque capability,
     /// preserving the capability bytes from the signed payload.
     pub fn into_opaque(self) -> Delegation {
@@ -141,7 +141,9 @@ impl<C: CapabilityEncoding> Delegation<C> {
     pub fn encode_string(&self) -> String {
         BASE32_LOWER_NOPAD.encode(&self.encode())
     }
+}
 
+impl<C: CapabilityEncoding> Delegation<C> {
     /// Decodes a delegation from its byte encoding, verifying the signature and
     /// decoding the capability as `C`.
     ///
@@ -208,7 +210,7 @@ impl<C: Clone> Delegation<C> {
 
 /// Serializes the delegation as its byte encoding, or as a base32 string when
 /// the format is human-readable. See [`Delegation::encode`].
-impl<C: CapabilityEncoding> Serialize for Delegation<C> {
+impl<C> Serialize for Delegation<C> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
@@ -358,7 +360,7 @@ pub struct DelegationBuilder<'s, C> {
     capability: C,
 }
 
-impl<C: CapabilityEncoding + Clone> DelegationBuilder<'_, C> {
+impl<C: CapabilityEncoding> DelegationBuilder<'_, C> {
     /// Signs the delegation, returning a [`Delegation<C>`] valid until
     /// `valid_until`.
     pub fn sign(self, valid_until: Expires) -> Delegation<C> {

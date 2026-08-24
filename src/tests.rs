@@ -201,11 +201,9 @@ fn rejects_non_canonical_varint() {
     assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("non-canonical"));
 }
 
-// The delegation wire format encodes numeric fields as postcard varints.
-// postcard accepts overlong encodings (e.g. `0` as `0x80 0x00`), so `decode`
-// re-encodes and rejects non-canonical forms; see `rejects_non_canonical_varint`
-// below. Structural truncation or padding is rejected as `DecodeError::Malformed`,
-// covered by `v2_decode_rejects_tampering`.
+// The delegation wire format encodes numeric fields as canonical postcard
+// varints. Structural truncation or padding is rejected as
+// `DecodeError::Malformed`, covered by `v2_decode_rejects_tampering`.
 
 #[test]
 fn rejects_v1() {
