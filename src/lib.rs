@@ -39,7 +39,7 @@ pub trait Capability: CapabilityEncoding {
 ///
 /// Bare `Delegation` (the default `C = OpaqueCapability`) holds the capability
 /// as raw bytes; turn it into a typed `Delegation<C>` with
-/// [`try_into_typed`](Delegation::try_into_typed).
+/// [`try_with_capability_type`](Delegation::try_with_capability_type).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delegation<C = OpaqueCapability> {
     issuer: VerifyingKey,
@@ -110,7 +110,24 @@ impl<C> Delegation<C> {
         &self.capability_bytes
     }
 
-    fn with_capability_type<D>(self) -> Delegation<D> {
+    /// Validates the capability bytes as `D` and changes the capability type.
+    pub fn try_with_capability_type<D: CapabilityEncoding>(
+        self,
+    ) -> Result<Delegation<D>, DecodeError> {
+        D::decode(&self.capability_bytes)?;
+        Ok(Delegation::new(
+            self.issuer,
+            self.audience,
+            self.capability_origin,
+            self.valid_until,
+            self.capability_bytes,
+            self.signature,
+        ))
+    }
+
+    /// Turns this delegation into a `Delegation` with an opaque capability,
+    /// preserving the capability bytes from the signed payload.
+    pub fn into_opaque(self) -> Delegation {
         Delegation::new(
             self.issuer,
             self.audience,
@@ -119,14 +136,6 @@ impl<C> Delegation<C> {
             self.capability_bytes,
             self.signature,
         )
-    }
-}
-
-impl<C> Delegation<C> {
-    /// Turns this delegation into a `Delegation` with an opaque capability,
-    /// preserving the capability bytes from the signed payload.
-    pub fn into_opaque(self) -> Delegation {
-        self.with_capability_type()
     }
 
     /// Returns the delegation's byte encoding.
@@ -269,40 +278,6 @@ impl CapabilityEncoding for OpaqueCapability {
 impl Capability for OpaqueCapability {
     fn permits(&self, other: &Self) -> bool {
         self == other
-    }
-}
-
-impl Delegation {
-    /// Consumes this delegation and returns it with the capability interpreted
-    /// as `C`, yielding a typed [`Delegation<C>`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DecodeError::WrongCapability`] if the bytes are not a valid
-    /// encoding of `C` (unless `C` is [`OpaqueCapability`], which accepts any
-    /// bytes).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use ed25519_dalek::SigningKey;
-    /// use rcan::{Delegation, Expires};
-    /// use serde::{Deserialize, Serialize};
-    ///
-    /// #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    /// enum Cap {
-    ///     Read,
-    /// }
-    ///
-    /// let key = SigningKey::from_bytes(&[0u8; 32]);
-    /// let typed =
-    ///     Delegation::issuing_builder(&key, key.verifying_key(), &Cap::Read).sign(Expires::Never);
-    /// let opaque = typed.into_opaque();
-    /// let back: Delegation<Cap> = opaque.try_into_typed().unwrap();
-    /// ```
-    pub fn try_into_typed<C: CapabilityEncoding>(self) -> Result<Delegation<C>, DecodeError> {
-        C::decode(&self.capability_bytes)?;
-        Ok(self.with_capability_type())
     }
 }
 
@@ -449,7 +424,8 @@ impl Authorizer {
     /// expiry against an explicit time instead of "now".
     ///
     /// Opaque delegations are not checked directly; parse them into a typed
-    /// delegation with [`try_into_typed`](Delegation::try_into_typed) first,
+    /// delegation with
+    /// [`try_with_capability_type`](Delegation::try_with_capability_type) first,
     /// then check them here.
     pub fn check_invocation_from_at<C: Capability>(
         &self,
