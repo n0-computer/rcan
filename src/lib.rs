@@ -207,7 +207,8 @@ impl<C: CapabilityEncoding> Serialize for Delegation<C> {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
         } else {
-            serializer.serialize_bytes(&self.encode())
+            let bytes = self.encode();
+            serde_bytes::Bytes::new(&bytes).serialize(serializer)
         }
     }
 }
@@ -220,42 +221,11 @@ impl<'de, C: CapabilityEncoding> Deserialize<'de> for Delegation<C> {
             let s = String::deserialize(deserializer)?;
             Self::decode_string(&s)
         } else {
-            let v = deserialize_byte_buf(deserializer)?;
-            Self::decode(&v)
+            let bytes = serde_bytes::ByteBuf::deserialize(deserializer)?;
+            Self::decode(&bytes)
         };
         delegation.map_err(D::Error::custom)
     }
-}
-
-fn deserialize_byte_buf<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct ByteBufVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for ByteBufVisitor {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a byte buffer")
-        }
-
-        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(value.to_vec())
-        }
-
-        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(value)
-        }
-    }
-
-    deserializer.deserialize_byte_buf(ByteBufVisitor)
 }
 
 /// A capability as raw, uninterpreted bytes.
