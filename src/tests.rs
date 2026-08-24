@@ -88,7 +88,7 @@ fn wire_snapshots() {
     assert_eq!(v2.audience(), &key(1).verifying_key());
     assert_eq!(v2.expires(), &Expires::At(4_102_444_800));
     assert_eq!(v2.capability_owner(), &key(0).verifying_key());
-    assert_eq!(*v2.capability(), Rpc::ReadWrite);
+    assert_eq!(v2.capability(), Rpc::ReadWrite);
 
     let never = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
         .sign(Expires::Never);
@@ -219,7 +219,7 @@ fn rejects_v1() {
 #[test]
 fn opaque_roundtrip() {
     let typed = delegation();
-    assert_eq!(*typed.capability(), Rpc::ReadWrite);
+    assert_eq!(typed.capability(), Rpc::ReadWrite);
 
     let untyped: Delegation = typed.clone().into_opaque();
     let again = untyped.clone().try_into_typed::<Rpc>().unwrap();
@@ -261,7 +261,7 @@ fn hashmap_capability_roundtrips() {
     let encoded = delegation.encode();
     let decoded = Delegation::<std::collections::HashMap<u64, u64>>::decode(&encoded).unwrap();
 
-    assert_eq!(decoded.capability(), &capability);
+    assert_eq!(decoded.capability(), capability);
 }
 
 #[test]
