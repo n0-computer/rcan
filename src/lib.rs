@@ -600,7 +600,7 @@ pub(crate) const BASE32_LOWER_NOPAD: data_encoding::Encoding = data_encoding_mac
     symbols: "abcdefghijklmnopqrstuvwxyz234567",
 );
 
-fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<u8>) {
+fn encode_body<C>(delegation: &Delegation<C>, out: &mut Vec<u8>) {
     out.extend_from_slice(delegation.issuer.as_bytes());
     out.extend_from_slice(delegation.audience.as_bytes());
     match &delegation.capability_origin {
@@ -617,9 +617,8 @@ fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<
             write_varint(*t, out);
         }
     }
-    let capability = C::encode(&delegation.capability);
-    write_varint(capability.len() as u64, out);
-    out.extend_from_slice(&capability);
+    write_varint(delegation.capability_bytes.len() as u64, out);
+    out.extend_from_slice(&delegation.capability_bytes);
 }
 
 fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C>, DecodeError> {
