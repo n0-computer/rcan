@@ -231,7 +231,8 @@ impl<C> Serialize for Delegation<C> {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
         } else {
-            serializer.serialize_bytes(&self.encode())
+            let bytes = self.encode();
+            serde_bytes::Bytes::new(&bytes).serialize(serializer)
         }
     }
 }
@@ -244,8 +245,8 @@ impl<'de, C: CapabilityEncoding> Deserialize<'de> for Delegation<C> {
             let s = String::deserialize(deserializer)?;
             Self::decode_string(&s)
         } else {
-            let v = Vec::<u8>::deserialize(deserializer)?;
-            Self::decode(&v)
+            let bytes = serde_bytes::ByteBuf::deserialize(deserializer)?;
+            Self::decode(&bytes)
         };
         delegation.map_err(D::Error::custom)
     }

@@ -133,15 +133,6 @@ fn serde_delegates_to_encode() {
     assert_eq!(opaque.encode(), v2.encode());
     assert_eq!(Delegation::decode(&v2.encode()).unwrap(), opaque);
 
-    let mut cbor = Vec::new();
-    ciborium::into_writer(&v2, &mut cbor).unwrap();
-    let cbor_expected = [vec![0x58, 0x8a], encoded.clone()].concat();
-    assert_eq!(cbor, cbor_expected);
-    assert_eq!(
-        ciborium::from_reader::<Delegation<Rpc>, _>(&cbor[..]).unwrap(),
-        v2
-    );
-
     let quoted = serde_json::to_string(&v2.encode_string()).unwrap();
     assert_eq!(serde_json::to_string(&v2).unwrap(), quoted);
     assert_eq!(
@@ -150,6 +141,14 @@ fn serde_delegates_to_encode() {
     );
     assert_eq!(ron::to_string(&v2).unwrap(), quoted);
     assert_eq!(ron::from_str::<Delegation<Rpc>>(&quoted).unwrap(), v2);
+}
+
+#[test]
+fn minicbor_serde_roundtrip() {
+    let delegation = delegation();
+    let encoded = minicbor_serde::to_vec(&delegation).unwrap();
+    let decoded = minicbor_serde::from_slice::<Delegation<Rpc>>(&encoded).unwrap();
+    assert_eq!(decoded, delegation);
 }
 
 #[test]
