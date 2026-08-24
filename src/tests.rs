@@ -252,6 +252,21 @@ fn rejects_wrong_capability_type() {
 }
 
 #[test]
+fn hashmap_capability_roundtrips() {
+    let issuer = key(0);
+    let audience = key(1).verifying_key();
+    let capability: std::collections::HashMap<u64, u64> =
+        (0..64).map(|value| (value, value * 2)).collect();
+
+    let delegation =
+        Delegation::issuing_builder(&issuer, audience, &capability).sign(Expires::Never);
+    let encoded = delegation.encode();
+    let decoded = Delegation::<std::collections::HashMap<u64, u64>>::decode(&encoded).unwrap();
+
+    assert_eq!(decoded.capability(), &capability);
+}
+
+#[test]
 fn two_link_chain_invocation() {
     let service = key(0);
     let alice = key(1);
