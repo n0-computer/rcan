@@ -596,22 +596,21 @@ fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<
     out.extend_from_slice(delegation.issuer.as_bytes());
     out.extend_from_slice(delegation.audience.as_bytes());
     match &delegation.capability_origin {
-        // `0u64`/`1u64` as varints
-        CapabilityOrigin::Issuer => out.extend_from_slice(&postcard::to_stdvec(&0u64).unwrap()),
+        CapabilityOrigin::Issuer => write_varint(0, out),
         CapabilityOrigin::Delegation(root) => {
-            out.extend_from_slice(&postcard::to_stdvec(&1u64).unwrap());
+            write_varint(1, out);
             out.extend_from_slice(root.as_bytes());
         }
     }
     match &delegation.valid_until {
-        Expires::Never => out.extend_from_slice(&postcard::to_stdvec(&0u64).unwrap()),
+        Expires::Never => write_varint(0, out),
         Expires::At(t) => {
-            out.extend_from_slice(&postcard::to_stdvec(&1u64).unwrap());
-            out.extend_from_slice(&postcard::to_stdvec(t).unwrap());
+            write_varint(1, out);
+            write_varint(*t, out);
         }
     }
     let capability = C::encode(&delegation.capability);
-    out.extend_from_slice(&postcard::to_stdvec(&(capability.len() as u64)).unwrap());
+    write_varint(capability.len() as u64, out);
     out.extend_from_slice(&capability);
 }
 
@@ -652,7 +651,7 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
 fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, DecodeError> {
     let issuer = take_key(buf)?;
     let audience = take_key(buf)?;
-    let capability_origin = match take_u64(buf)? {
+    let capability_origin = match take_varint(buf)? {
         0 => CapabilityOrigin::Issuer,
         1 => CapabilityOrigin::Delegation(take_key(buf)?),
         tag => {
@@ -661,12 +660,12 @@ fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, 
             )))
         }
     };
-    let valid_until = match take_u64(buf)? {
+    let valid_until = match take_varint(buf)? {
         0 => Expires::Never,
-        1 => Expires::At(take_u64(buf)?),
+        1 => Expires::At(take_varint(buf)?),
         tag => return Err(DecodeError::malformed(format!("unknown expires tag {tag}"))),
     };
-    let cap_len = usize::try_from(take_u64(buf)?)
+    let cap_len = usize::try_from(take_varint(buf)?)
         .map_err(|_| DecodeError::malformed("capability length overflow"))?;
     let cap_bytes = take_bytes(buf, cap_len)?;
     let capability = C::decode(cap_bytes)?;
@@ -702,17 +701,29 @@ fn take_key(buf: &mut &[u8]) -> Result<VerifyingKey, DecodeError> {
     VerifyingKey::from_bytes(bytes).map_err(|_| DecodeError::malformed("invalid key"))
 }
 
-fn take_u64(buf: &mut &[u8]) -> Result<u64, DecodeError> {
+/// Appends postcard's canonical varint encoding of `value` to `out`.
+fn write_varint(value: u64, out: &mut Vec<u8>) {
+    let mut buf = [0u8; 10];
+    let encoded = postcard::to_slice(&value, &mut buf).expect("u64 fits in ten bytes");
+    out.extend_from_slice(encoded);
+}
+
+/// Takes one canonically postcard-encoded `u64` from the front of `buf`.
+///
+/// The input slice is advanced only on success. This rejects truncated,
+/// overflowing, and non-minimal encodings without heap allocation.
+fn take_varint(buf: &mut &[u8]) -> Result<u64, DecodeError> {
     let before = *buf;
-    let (value, rest) = postcard::take_from_bytes::<u64>(buf)
-        .map_err(|e| DecodeError::malformed(format!("invalid varint: {e}")))?;
+    let (value, rest) = postcard::take_from_bytes::<u64>(before)
+        .map_err(|error| DecodeError::malformed(format!("invalid varint: {error}")))?;
     let consumed = &before[..before.len() - rest.len()];
-    // postcard allows overlong varints (e.g. 0 as `0x80 0x00`); the delegation
-    // body requires the canonical encoding, so re-encode and compare.
-    let canonical = postcard::to_stdvec(&value).expect("u64 serializes");
-    if consumed != &canonical[..] {
+
+    let mut canonical_buf = [0u8; 10];
+    let canonical = postcard::to_slice(&value, &mut canonical_buf).expect("u64 fits in ten bytes");
+    if consumed != canonical {
         return Err(DecodeError::malformed("non-canonical varint"));
     }
+
     *buf = rest;
     Ok(value)
 }
