@@ -69,7 +69,7 @@ jobs:
         # cross tests are currently broken vor armv7 and aarch64
         # see https://github.com/cross-rs/cross/issues/1311.  So on
         # those platforms we only build but do not run tests.
-        run: cross build --all --target ${{ matrix.target }}
+        run: cross build --locked --all --target ${{ matrix.target }}
         env:
           RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG'}}
 
@@ -117,8 +117,8 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          cargo install --version 3.5.4 cargo-ndk
-          cargo ndk --target ${{ matrix.target }} build
+          cargo install --locked --version 3.5.4 cargo-ndk
+          cargo ndk --target ${{ matrix.target }} build --locked
 
   cross_test:
     name: Cross Test
@@ -152,7 +152,7 @@ jobs:
           tool: cross
 
       - name: test
-        run: cross test --all --target ${{ matrix.target }} -- --test-threads=12
+        run: cross test --locked --all --target ${{ matrix.target }} -- --test-threads=12
         env:
           RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG' }}
 
@@ -177,7 +177,7 @@ jobs:
         uses: bytecodealliance/actions/wasm-tools/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
 
       - name: wasm32 build
-        run: cargo build --target wasm32-unknown-unknown
+        run: cargo build --locked --target wasm32-unknown-unknown
 
       # If the Wasm file contains any 'import "env"' declarations, then
       # some non-Wasm-compatible code made it into the final code.
@@ -233,6 +233,9 @@ jobs:
         with:
           tool: cargo-make
       - run: cargo make format-check
+      - name: Lockfile must not have moved
+        # cargo make takes no --locked; assert the lockfile instead.
+        run: git diff --exit-code Cargo.lock
 
   check_docs:
     timeout-minutes: 30
@@ -250,7 +253,7 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Docs
-        run: cargo doc --workspace --all-features --no-deps --document-private-items
+        run: cargo doc --locked --workspace --all-features --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: --cfg docsrs
 
@@ -272,13 +275,13 @@ jobs:
       # TODO: We have a bunch of platform-dependent code so should
       #    probably run this job on the full platform matrix
       - name: clippy check (all features)
-        run: cargo clippy --workspace --all-features --all-targets --bins --tests --benches
+        run: cargo clippy --locked --workspace --all-features --all-targets --bins --tests --benches
 
       - name: clippy check (no features)
-        run: cargo clippy --workspace --no-default-features --lib --bins --tests
+        run: cargo clippy --locked --workspace --no-default-features --lib --bins --tests
 
       - name: clippy check (default features)
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets
 
   msrv:
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
@@ -298,7 +301,7 @@ jobs:
 
       - name: Check MSRV all features
         run: |
-          cargo +$MSRV check --workspace --all-targets
+          cargo +$MSRV check --locked --workspace --all-targets
 
   cargo_deny:
     timeout-minutes: 30
