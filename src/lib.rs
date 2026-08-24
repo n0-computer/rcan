@@ -46,8 +46,10 @@ pub struct Delegation<C = OpaqueCapability> {
     audience: VerifyingKey,
     capability_origin: CapabilityOrigin,
     valid_until: Expires,
-    capability: C,
+    /// The exact capability representation used by the signed payload.
+    capability_bytes: Vec<u8>,
     signature: Signature,
+    capability_type: std::marker::PhantomData<C>,
 }
 
 impl<C> Delegation<C> {
@@ -56,7 +58,7 @@ impl<C> Delegation<C> {
         audience: VerifyingKey,
         capability_origin: CapabilityOrigin,
         valid_until: Expires,
-        capability: C,
+        capability_bytes: Vec<u8>,
         signature: Signature,
     ) -> Self {
         Self {
@@ -64,8 +66,9 @@ impl<C> Delegation<C> {
             audience,
             capability_origin,
             valid_until,
-            capability,
+            capability_bytes,
             signature,
+            capability_type: std::marker::PhantomData,
         }
     }
 
@@ -102,24 +105,28 @@ impl<C> Delegation<C> {
         &self.valid_until
     }
 
-    /// Returns the stored capability by reference.
-    pub fn capability(&self) -> &C {
-        &self.capability
+    /// Returns the encoded capability bytes from the signed payload.
+    pub fn capability_bytes(&self) -> &[u8] {
+        &self.capability_bytes
     }
-}
 
-impl<C: CapabilityEncoding> Delegation<C> {
-    /// Turns this delegation into a `Delegation` with an opaque capability,
-    /// encoding the capability to bytes.
-    pub fn into_opaque(self) -> Delegation {
+    fn with_capability_type<D>(self) -> Delegation<D> {
         Delegation::new(
             self.issuer,
             self.audience,
             self.capability_origin,
             self.valid_until,
-            OpaqueCapability(C::encode(&self.capability)),
+            self.capability_bytes,
             self.signature,
         )
+    }
+}
+
+impl<C> Delegation<C> {
+    /// Turns this delegation into a `Delegation` with an opaque capability,
+    /// preserving the capability bytes from the signed payload.
+    pub fn into_opaque(self) -> Delegation {
+        self.with_capability_type()
     }
 
     /// Returns the delegation's byte encoding.
@@ -134,6 +141,14 @@ impl<C: CapabilityEncoding> Delegation<C> {
     /// useful for compact, printable representations.
     pub fn encode_string(&self) -> String {
         BASE32_LOWER_NOPAD.encode(&self.encode())
+    }
+}
+
+impl<C: CapabilityEncoding> Delegation<C> {
+    /// Decodes and returns the capability from the signed payload.
+    pub fn capability(&self) -> C {
+        C::decode(&self.capability_bytes)
+            .expect("capability was validated when the delegation was constructed")
     }
 
     /// Decodes a delegation from its byte encoding, verifying the signature and
@@ -202,7 +217,7 @@ impl<C: Clone> Delegation<C> {
 
 /// Serializes the delegation as its byte encoding, or as a base32 string when
 /// the format is human-readable. See [`Delegation::encode`].
-impl<C: CapabilityEncoding> Serialize for Delegation<C> {
+impl<C> Serialize for Delegation<C> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
@@ -287,15 +302,8 @@ impl Delegation {
     /// let back: Delegation<Cap> = opaque.try_into_typed().unwrap();
     /// ```
     pub fn try_into_typed<C: CapabilityEncoding>(self) -> Result<Delegation<C>, DecodeError> {
-        let capability = C::decode(self.capability.as_bytes())?;
-        Ok(Delegation::new(
-            self.issuer,
-            self.audience,
-            self.capability_origin,
-            self.valid_until,
-            capability,
-            self.signature,
-        ))
+        C::decode(&self.capability_bytes)?;
+        Ok(self.with_capability_type())
     }
 }
 
@@ -352,16 +360,17 @@ pub struct DelegationBuilder<'s, C> {
     capability: C,
 }
 
-impl<C: CapabilityEncoding + Clone> DelegationBuilder<'_, C> {
+impl<C: CapabilityEncoding> DelegationBuilder<'_, C> {
     /// Signs the delegation, returning a [`Delegation<C>`] valid until
     /// `valid_until`.
     pub fn sign(self, valid_until: Expires) -> Delegation<C> {
+        let capability_bytes = C::encode(&self.capability);
         let delegation = Delegation::new(
             self.issuer.verifying_key(),
             self.audience,
             self.capability_origin,
             valid_until,
-            self.capability,
+            capability_bytes,
             Signature::from_bytes(&[0u8; 64]),
         );
         let mut to_sign = DST.to_vec();
@@ -592,7 +601,7 @@ pub(crate) const BASE32_LOWER_NOPAD: data_encoding::Encoding = data_encoding_mac
     symbols: "abcdefghijklmnopqrstuvwxyz234567",
 );
 
-fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<u8>) {
+fn encode_body<C>(delegation: &Delegation<C>, out: &mut Vec<u8>) {
     out.extend_from_slice(delegation.issuer.as_bytes());
     out.extend_from_slice(delegation.audience.as_bytes());
     match &delegation.capability_origin {
@@ -609,9 +618,8 @@ fn encode_body<C: CapabilityEncoding>(delegation: &Delegation<C>, out: &mut Vec<
             write_varint(*t, out);
         }
     }
-    let capability = C::encode(&delegation.capability);
-    write_varint(capability.len() as u64, out);
-    out.extend_from_slice(&capability);
+    write_varint(delegation.capability_bytes.len() as u64, out);
+    out.extend_from_slice(&delegation.capability_bytes);
 }
 
 fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C>, DecodeError> {
@@ -630,10 +638,7 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
             .map_err(|_| DecodeError::malformed("invalid signature length"))?,
     );
     let mut to_verify = DST.to_vec();
-    encode_body::<C>(&delegation, &mut to_verify);
-    if to_verify[DST.len()..] != *body_bytes {
-        return Err(DecodeError::malformed("non canonical encoding of payload"));
-    }
+    to_verify.extend_from_slice(body_bytes);
     delegation
         .issuer
         .verify_strict(&to_verify, &signature)
@@ -643,7 +648,7 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
         delegation.audience,
         delegation.capability_origin,
         delegation.valid_until,
-        delegation.capability,
+        delegation.capability_bytes,
         signature,
     ))
 }
@@ -668,14 +673,15 @@ fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, 
     let cap_len = usize::try_from(take_varint(buf)?)
         .map_err(|_| DecodeError::malformed("capability length overflow"))?;
     let cap_bytes = take_bytes(buf, cap_len)?;
-    let capability = C::decode(cap_bytes)?;
+    C::decode(cap_bytes)?;
+    let capability_bytes = cap_bytes.to_vec();
 
     Ok(Delegation::new(
         issuer,
         audience,
         capability_origin,
         valid_until,
-        capability,
+        capability_bytes,
         Signature::from_bytes(&[0u8; 64]),
     ))
 }

@@ -88,7 +88,7 @@ fn wire_snapshots() {
     assert_eq!(v2.audience(), &key(1).verifying_key());
     assert_eq!(v2.expires(), &Expires::At(4_102_444_800));
     assert_eq!(v2.capability_owner(), &key(0).verifying_key());
-    assert_eq!(*v2.capability(), Rpc::ReadWrite);
+    assert_eq!(v2.capability(), Rpc::ReadWrite);
 
     let never = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
         .sign(Expires::Never);
@@ -200,11 +200,9 @@ fn rejects_non_canonical_varint() {
     assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("non-canonical"));
 }
 
-// The delegation wire format encodes numeric fields as postcard varints.
-// postcard accepts overlong encodings (e.g. `0` as `0x80 0x00`), so `decode`
-// re-encodes and rejects non-canonical forms; see `rejects_non_canonical_varint`
-// below. Structural truncation or padding is rejected as `DecodeError::Malformed`,
-// covered by `v2_decode_rejects_tampering`.
+// The delegation wire format encodes numeric fields as canonical postcard
+// varints. Structural truncation or padding is rejected as
+// `DecodeError::Malformed`, covered by `v2_decode_rejects_tampering`.
 
 #[test]
 fn rejects_v1() {
@@ -220,7 +218,7 @@ fn rejects_v1() {
 #[test]
 fn opaque_roundtrip() {
     let typed = delegation();
-    assert_eq!(*typed.capability(), Rpc::ReadWrite);
+    assert_eq!(typed.capability(), Rpc::ReadWrite);
 
     let untyped: Delegation = typed.clone().into_opaque();
     let again = untyped.clone().try_into_typed::<Rpc>().unwrap();
@@ -248,6 +246,21 @@ fn rejects_wrong_capability_type() {
 
     let wire = postcard::to_stdvec(&typed).unwrap();
     assert!(postcard::from_bytes::<Delegation<OtherCapability>>(&wire).is_err());
+}
+
+#[test]
+fn hashmap_capability_roundtrips() {
+    let issuer = key(0);
+    let audience = key(1).verifying_key();
+    let capability: std::collections::HashMap<u64, u64> =
+        (0..64).map(|value| (value, value * 2)).collect();
+
+    let delegation =
+        Delegation::issuing_builder(&issuer, audience, &capability).sign(Expires::Never);
+    let encoded = delegation.encode();
+    let decoded = Delegation::<std::collections::HashMap<u64, u64>>::decode(&encoded).unwrap();
+
+    assert_eq!(decoded.capability(), capability);
 }
 
 #[test]
