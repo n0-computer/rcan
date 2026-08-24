@@ -637,10 +637,7 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
             .map_err(|_| DecodeError::malformed("invalid signature length"))?,
     );
     let mut to_verify = DST.to_vec();
-    encode_body::<C>(&delegation, &mut to_verify);
-    if to_verify[DST.len()..] != *body_bytes {
-        return Err(DecodeError::malformed("non canonical encoding of payload"));
-    }
+    to_verify.extend_from_slice(body_bytes);
     delegation
         .issuer
         .verify_strict(&to_verify, &signature)
