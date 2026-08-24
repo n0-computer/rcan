@@ -144,10 +144,10 @@ fn serde_delegates_to_encode() {
 }
 
 #[test]
-fn serde_cbor_roundtrip() {
+fn minicbor_serde_roundtrip() {
     let delegation = delegation();
-    let encoded = serde_cbor::to_vec(&delegation).unwrap();
-    let decoded = serde_cbor::from_slice::<Delegation<Rpc>>(&encoded).unwrap();
+    let encoded = minicbor_serde::to_vec(&delegation).unwrap();
+    let decoded = minicbor_serde::from_slice::<Delegation<Rpc>>(&encoded).unwrap();
     assert_eq!(decoded, delegation);
 }
 
