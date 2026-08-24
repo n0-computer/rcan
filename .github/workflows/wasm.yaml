@@ -8,6 +8,10 @@ on:
     branches:
       - main
 
+# Default to read-only; jobs that need more grant it explicitly.
+permissions:
+  contents: read
+
 jobs:
   wasm_check:
     name: Build & check wasm32 for browsers
