@@ -19,8 +19,6 @@ use smallvec::SmallVec;
 #[cfg(test)]
 mod tests;
 
-type WireBytes = SmallVec<[u8; 192]>;
-
 /// A grantable capability.
 ///
 /// Implement this for your own capability type, typically an enum of the
@@ -143,8 +141,8 @@ impl<C> Delegation<C> {
         BASE32_LOWER_NOPAD.encode(&self.encode_wire())
     }
 
-    fn encode_wire(&self) -> WireBytes {
-        let mut bytes = WireBytes::new();
+    fn encode_wire(&self) -> SmallVec<[u8; 192]> {
+        let mut bytes = SmallVec::new();
         bytes.push(2);
         encode_body(self, &mut bytes);
         bytes.extend_from_slice(&self.signature.to_bytes());
@@ -186,7 +184,7 @@ impl<C: CapabilityEncoding> Delegation<C> {
         let len = BASE32_LOWER_NOPAD
             .decode_len(s.len())
             .map_err(DecodeError::malformed)?;
-        let mut bytes = WireBytes::new();
+        let mut bytes = SmallVec::<[u8; 192]>::new();
         bytes.resize(len, 0);
         let len = BASE32_LOWER_NOPAD
             .decode_mut(s.as_bytes(), &mut bytes)
@@ -272,8 +270,8 @@ impl OpaqueCapability {
 }
 
 impl CapabilityEncoding for OpaqueCapability {
-    fn encode(&self) -> Vec<u8> {
-        self.0.to_vec()
+    fn encode_into(&self, out: &mut impl Extend<u8>) {
+        out.extend(self.0.iter().copied());
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
@@ -378,7 +376,8 @@ impl<C: CapabilityEncoding> DelegationBuilder<'_, C> {
     /// Signs the delegation, returning a [`Delegation<C>`] valid until
     /// `valid_until`.
     pub fn sign(self, valid_until: Expires) -> Delegation<C> {
-        let capability_bytes: SmallVec<[u8; 32]> = C::encode(&self.capability).into();
+        let mut capability_bytes = SmallVec::<[u8; 32]>::new();
+        self.capability.encode_into(&mut capability_bytes);
         let delegation = Delegation::new(
             self.issuer.verifying_key(),
             self.audience,
@@ -387,7 +386,7 @@ impl<C: CapabilityEncoding> DelegationBuilder<'_, C> {
             capability_bytes,
             Signature::from_bytes(&[0u8; 64]),
         );
-        let mut to_sign = WireBytes::from_slice(DST);
+        let mut to_sign = SmallVec::<[u8; 192]>::from_slice(DST);
         encode_body(&delegation, &mut to_sign);
         let signature = self.issuer.sign(&to_sign);
         Delegation {
@@ -514,8 +513,9 @@ impl Authorizer {
 /// implement this yourself: any [`Serialize`] + [`Deserialize`] type is
 /// supported automatically.
 pub trait CapabilityEncoding {
-    /// Returns the bytes this capability is represented as inside a delegation.
-    fn encode(&self) -> Vec<u8>;
+    /// Appends the bytes representing this capability inside a delegation to
+    /// `out`.
+    fn encode_into(&self, out: &mut impl Extend<u8>);
 
     /// Decodes a capability from its bytes.
     ///
@@ -528,9 +528,17 @@ pub trait CapabilityEncoding {
         Self: Sized;
 }
 
+struct ExtendRef<'a, T>(&'a mut T);
+
+impl<T: Extend<u8>> Extend<u8> for ExtendRef<'_, T> {
+    fn extend<I: IntoIterator<Item = u8>>(&mut self, iter: I) {
+        self.0.extend(iter);
+    }
+}
+
 impl<T: Serialize + DeserializeOwned> CapabilityEncoding for T {
-    fn encode(&self) -> Vec<u8> {
-        postcard::to_stdvec(self).expect("capability serializes")
+    fn encode_into(&self, out: &mut impl Extend<u8>) {
+        postcard::to_extend(self, ExtendRef(out)).expect("capability serializes");
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
@@ -615,7 +623,7 @@ pub(crate) const BASE32_LOWER_NOPAD: data_encoding::Encoding = data_encoding_mac
     symbols: "abcdefghijklmnopqrstuvwxyz234567",
 );
 
-fn encode_body<C>(delegation: &Delegation<C>, out: &mut WireBytes) {
+fn encode_body<C>(delegation: &Delegation<C>, out: &mut SmallVec<[u8; 192]>) {
     out.extend_from_slice(delegation.issuer.as_bytes());
     out.extend_from_slice(delegation.audience.as_bytes());
     match &delegation.capability_origin {
@@ -651,7 +659,7 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
             .try_into()
             .map_err(|_| DecodeError::malformed("invalid signature length"))?,
     );
-    let mut to_verify = WireBytes::from_slice(DST);
+    let mut to_verify = SmallVec::<[u8; 192]>::from_slice(DST);
     to_verify.extend_from_slice(body_bytes);
     delegation
         .issuer
@@ -722,7 +730,7 @@ fn take_key(buf: &mut &[u8]) -> Result<VerifyingKey, DecodeError> {
 }
 
 /// Appends postcard's canonical varint encoding of `value` to `out`.
-fn write_varint(value: u64, out: &mut WireBytes) {
+fn write_varint(value: u64, out: &mut SmallVec<[u8; 192]>) {
     let mut buf = [0u8; 10];
     let encoded = postcard::to_slice(&value, &mut buf).expect("u64 fits in ten bytes");
     out.extend_from_slice(encoded);
