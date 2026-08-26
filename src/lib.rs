@@ -143,16 +143,10 @@ impl<C> Delegation<C> {
     /// }
     ///
     /// let key = SigningKey::from_bytes(&[0u8; 32]);
-    /// let typed = Delegation::issue(
-    ///     &key,
-    ///     key.verifying_key(),
-    ///     &Cap::Read,
-    ///     Expires::Never,
-    /// );
+    /// let typed = Delegation::issue(&key, key.verifying_key(), &Cap::Read, Expires::Never);
     /// let opaque = typed.into_opaque();
     /// let back: Delegation<Cap> = opaque.try_with_capability_type().unwrap();
     /// ```
-    ///
     pub fn try_with_capability_type<D: CapabilityEncoding>(
         self,
     ) -> Result<Delegation<D>, DecodeError> {
@@ -428,12 +422,7 @@ impl Authorizer {
     ///
     /// let service = SigningKey::from_bytes(&[0u8; 32]);
     /// let alice = SigningKey::from_bytes(&[1u8; 32]);
-    /// let grant = Delegation::issue(
-    ///     &service,
-    ///     alice.verifying_key(),
-    ///     &Cap::All,
-    ///     Expires::Never,
-    /// );
+    /// let grant = Delegation::issue(&service, alice.verifying_key(), &Cap::All, Expires::Never);
     ///
     /// Authorizer::new(service.verifying_key())
     ///     .check_invocation_from(alice.verifying_key(), Cap::Read, &[&grant])
