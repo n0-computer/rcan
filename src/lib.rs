@@ -132,21 +132,27 @@ impl<C> Delegation<C> {
 
     /// Returns the delegation's byte encoding.
     pub fn encode(&self) -> Vec<u8> {
-        self.encode_wire().into_vec()
+        let mut bytes = SmallVec::<[u8; 192]>::new();
+        self.encode_into(&mut bytes);
+        bytes.into_vec()
+    }
+
+    /// Appends the delegation's byte encoding to `out`.
+    ///
+    /// This is identical to [`encode`](Delegation::encode) but avoids an
+    /// allocation when the caller can provide a buffer.
+    pub fn encode_into(&self, out: &mut impl Extend<u8>) {
+        out.extend(std::iter::once(2));
+        encode_body(self, out);
+        out.extend(self.signature.to_bytes());
     }
 
     /// Returns a lowercase base32 string of the delegation's byte encoding,
     /// useful for compact, printable representations.
     pub fn encode_string(&self) -> String {
-        BASE32_LOWER_NOPAD.encode(&self.encode_wire())
-    }
-
-    fn encode_wire(&self) -> SmallVec<[u8; 192]> {
-        let mut bytes = SmallVec::new();
-        bytes.push(2);
-        encode_body(self, &mut bytes);
-        bytes.extend_from_slice(&self.signature.to_bytes());
-        bytes
+        let mut bytes = SmallVec::<[u8; 192]>::new();
+        self.encode_into(&mut bytes);
+        BASE32_LOWER_NOPAD.encode(&bytes)
     }
 }
 
@@ -228,13 +234,14 @@ impl<C: Clone> Delegation<C> {
 }
 
 /// Serializes the delegation as its byte encoding, or as a base32 string when
-/// the format is human-readable. See [`Delegation::encode`].
+/// the format is human-readable. See [`Delegation::encode_into`].
 impl<C> Serialize for Delegation<C> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
         } else {
-            let bytes = self.encode_wire();
+            let mut bytes = SmallVec::<[u8; 192]>::new();
+            self.encode_into(&mut bytes);
             serde_bytes::Bytes::new(&bytes).serialize(serializer)
         }
     }
@@ -623,14 +630,14 @@ pub(crate) const BASE32_LOWER_NOPAD: data_encoding::Encoding = data_encoding_mac
     symbols: "abcdefghijklmnopqrstuvwxyz234567",
 );
 
-fn encode_body<C>(delegation: &Delegation<C>, out: &mut SmallVec<[u8; 192]>) {
-    out.extend_from_slice(delegation.issuer.as_bytes());
-    out.extend_from_slice(delegation.audience.as_bytes());
+fn encode_body<C>(delegation: &Delegation<C>, out: &mut impl Extend<u8>) {
+    out.extend(delegation.issuer.as_bytes().iter().copied());
+    out.extend(delegation.audience.as_bytes().iter().copied());
     match &delegation.capability_origin {
         CapabilityOrigin::Issuer => write_varint(0, out),
         CapabilityOrigin::Delegation(root) => {
             write_varint(1, out);
-            out.extend_from_slice(root.as_bytes());
+            out.extend(root.as_bytes().iter().copied());
         }
     }
     match &delegation.valid_until {
@@ -641,7 +648,7 @@ fn encode_body<C>(delegation: &Delegation<C>, out: &mut SmallVec<[u8; 192]>) {
         }
     }
     write_varint(delegation.capability_bytes.len() as u64, out);
-    out.extend_from_slice(&delegation.capability_bytes);
+    out.extend(delegation.capability_bytes.iter().copied());
 }
 
 fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C>, DecodeError> {
@@ -730,10 +737,10 @@ fn take_key(buf: &mut &[u8]) -> Result<VerifyingKey, DecodeError> {
 }
 
 /// Appends postcard's canonical varint encoding of `value` to `out`.
-fn write_varint(value: u64, out: &mut SmallVec<[u8; 192]>) {
+fn write_varint(value: u64, out: &mut impl Extend<u8>) {
     let mut buf = [0u8; 10];
     let encoded = postcard::to_slice(&value, &mut buf).expect("u64 fits in ten bytes");
-    out.extend_from_slice(encoded);
+    out.extend(encoded.iter().copied());
 }
 
 /// Takes one canonically postcard-encoded `u64` from the front of `buf`.
