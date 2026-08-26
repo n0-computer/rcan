@@ -35,8 +35,12 @@ fn key(seed: u8) -> SigningKey {
 }
 
 fn delegation() -> Delegation<Rpc> {
-    Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::ReadWrite)
-        .sign(Expires::At(4_102_444_800))
+    Delegation::issue(
+        &key(0),
+        key(1).verifying_key(),
+        &Rpc::ReadWrite,
+        Expires::At(4_102_444_800),
+    )
 }
 
 fn hexdump(s: &str) -> Vec<u8> {
@@ -90,8 +94,7 @@ fn wire_snapshots() {
     assert_eq!(v2.capability_owner(), &key(0).verifying_key());
     assert_eq!(v2.capability(), Rpc::ReadWrite);
 
-    let never = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::All)
-        .sign(Expires::Never);
+    let never = Delegation::issue(&key(0), key(1).verifying_key(), &Rpc::All, Expires::Never);
     assert_eq!(hex::encode(never.encode()), hex::encode(hexdump(V2_NEVER)));
     assert_eq!(
         Delegation::<Rpc>::decode(&hexdump(V2_NEVER)).unwrap(),
@@ -153,9 +156,8 @@ fn minicbor_serde_roundtrip() {
 
 #[test]
 fn v2_decode_rejects_tampering() {
-    let good = Delegation::issuing_builder(&key(0), key(1).verifying_key(), &Rpc::Read)
-        .sign(Expires::Never)
-        .encode();
+    let good =
+        Delegation::issue(&key(0), key(1).verifying_key(), &Rpc::Read, Expires::Never).encode();
 
     let mut forged = good.clone();
     let n = forged.len();
@@ -221,11 +223,11 @@ fn opaque_roundtrip() {
     assert_eq!(typed.capability(), Rpc::ReadWrite);
 
     let untyped: Delegation = typed.clone().into_opaque();
-    let again = untyped.clone().try_into_typed::<Rpc>().unwrap();
+    let again = untyped.clone().try_with_capability_type::<Rpc>().unwrap();
     assert_eq!(again, typed);
 
-    let decoded = Delegation::decode(&typed.encode()).unwrap();
-    let again = decoded.try_into_typed::<Rpc>().unwrap();
+    let decoded: Delegation = Delegation::decode(&typed.encode()).unwrap();
+    let again = decoded.try_with_capability_type::<Rpc>().unwrap();
     assert_eq!(again, typed);
 }
 
@@ -239,7 +241,14 @@ fn rejects_wrong_capability_type() {
 
     let typed = delegation();
     let untyped: Delegation = typed.clone().into_opaque();
-    let err = untyped.try_into_typed::<OtherCapability>().unwrap_err();
+    let err = typed
+        .clone()
+        .try_with_capability_type::<OtherCapability>()
+        .unwrap_err();
+    assert_matches!(err, DecodeError::WrongCapability { .. });
+    let err = untyped
+        .try_with_capability_type::<OtherCapability>()
+        .unwrap_err();
     assert_matches!(err, DecodeError::WrongCapability { .. });
     let err = Delegation::<OtherCapability>::decode(&typed.encode()).unwrap_err();
     assert_matches!(err, DecodeError::WrongCapability { .. });
@@ -255,8 +264,7 @@ fn hashmap_capability_roundtrips() {
     let capability: std::collections::HashMap<u64, u64> =
         (0..64).map(|value| (value, value * 2)).collect();
 
-    let delegation =
-        Delegation::issuing_builder(&issuer, audience, &capability).sign(Expires::Never);
+    let delegation = Delegation::issue(&issuer, audience, &capability, Expires::Never);
     let encoded = delegation.encode();
     let decoded = Delegation::<std::collections::HashMap<u64, u64>>::decode(&encoded).unwrap();
 
@@ -269,16 +277,20 @@ fn two_link_chain_invocation() {
     let alice = key(1);
     let bob = key(2);
 
-    let root = Delegation::issuing_builder(&service, alice.verifying_key(), &Rpc::All)
-        .sign(Expires::At(4_102_444_800));
+    let root = Delegation::issue(
+        &service,
+        alice.verifying_key(),
+        &Rpc::All,
+        Expires::At(4_102_444_800),
+    );
 
-    let link = Delegation::delegating_builder(
+    let link = Delegation::delegate(
         &alice,
         bob.verifying_key(),
         service.verifying_key(),
         &Rpc::Read,
-    )
-    .sign(Expires::Never);
+        Expires::Never,
+    );
 
     let authorizer = Authorizer::new(service.verifying_key());
     let chain = [&root, &link];
@@ -312,8 +324,8 @@ fn two_link_chain_invocation() {
     let opaque_link = link.into_opaque();
     // Opaque delegations are checked by parsing them into typed delegations first.
     let parsed_chain = [
-        opaque_root.try_into_typed::<Rpc>().unwrap(),
-        opaque_link.try_into_typed::<Rpc>().unwrap(),
+        opaque_root.try_with_capability_type::<Rpc>().unwrap(),
+        opaque_link.try_with_capability_type::<Rpc>().unwrap(),
     ];
     let refs = [&parsed_chain[0], &parsed_chain[1]];
     authorizer
@@ -331,8 +343,7 @@ fn chain_must_start_at_the_authorizer() {
     let alice = key(1);
     let bob = key(2);
 
-    let alice_grant =
-        Delegation::issuing_builder(&alice, bob.verifying_key(), &Rpc::All).sign(Expires::Never);
+    let alice_grant = Delegation::issue(&alice, bob.verifying_key(), &Rpc::All, Expires::Never);
     let authorizer = Authorizer::new(service.verifying_key());
     let err = authorizer
         .check_invocation_from(bob.verifying_key(), Rpc::Read, &[&alice_grant])
@@ -347,13 +358,13 @@ fn subject_must_be_the_authorizer() {
     let other = key(1);
     let alice = key(2);
 
-    let foreign_grant = Delegation::delegating_builder(
+    let foreign_grant = Delegation::delegate(
         &service,
         alice.verifying_key(),
         other.verifying_key(),
         &Rpc::All,
-    )
-    .sign(Expires::Never);
+        Expires::Never,
+    );
     let authorizer = Authorizer::new(service.verifying_key());
     let err = authorizer
         .check_invocation_from(alice.verifying_key(), Rpc::Read, &[&foreign_grant])
