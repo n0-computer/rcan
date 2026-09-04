@@ -2,6 +2,9 @@
 yanked = "deny"
 ignore = [
     "RUSTSEC-2023-0089",
+    # Pulled in through iroh's Linux netlink stack. There is no safe upgrade;
+    # remove this once netlink-packet-core no longer depends on paste.
+    "RUSTSEC-2024-0436",
 ]
 
 [bans]
@@ -19,9 +22,13 @@ allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
     "MIT",
+    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
+    "Zlib",
 ]
 
 [[licenses.clarify]]

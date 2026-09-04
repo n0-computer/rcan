@@ -1,0 +1,25 @@
+[package]
+name = "iroh-rcan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+description = "RCAN primitives bound to authenticated iroh connections"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/n0-computer/rcan"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+blake3 = "1.8.2"
+ed25519-dalek = ">=3.0.0-rc.0,<4.0.0"
+iroh = "1.0.3"
+n0-error = "1"
+postcard = { version = "1.1.1", features = ["use-std"] }
+rcan = { version = "0.5.0", path = ".." }
+serde = { version = "1.0.217", features = ["derive"] }
+tokio = { version = "1.44.2", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7.19"
+
+[dev-dependencies]

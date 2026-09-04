@@ -1,3 +1,7 @@
+[workspace]
+members = ["iroh-rcan"]
+resolver = "3"
+
 [package]
 name = "rcan"
 version = "0.5.0"
