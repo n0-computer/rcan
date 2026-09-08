@@ -12,12 +12,12 @@ use rcan::Delegation;
 use tokio::{sync::Notify, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Store, fetch::fetch};
+use crate::{Store, pull::pull};
 
 const RENEW_BEFORE_SECS: u64 = 10 * 60;
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
-const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const PULL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Signals that stored delegation evidence changed.
 #[derive(Clone)]
@@ -64,7 +64,7 @@ where
         let endpoint = endpoint.clone();
         let merge = merge.clone();
         async move {
-            match fetch(&endpoint, issuer).await {
+            match pull(&endpoint, issuer).await {
                 Ok(delegations) => merge(delegations).is_ok(),
                 Err(_) => false,
             }
@@ -72,7 +72,7 @@ where
     })
 }
 
-fn spawn_with<S, F, Fut>(audience: EndpointId, snapshot: S, fetch_from: F) -> RenewalHandle
+fn spawn_with<S, F, Fut>(audience: EndpointId, snapshot: S, pull_from: F) -> RenewalHandle
 where
     S: Fn() -> Store + Send + Sync + 'static,
     F: Fn(EndpointId) -> Fut + Send + Sync + 'static,
@@ -126,19 +126,19 @@ where
                 if scheduled > now {
                     continue;
                 }
-                let fetched = tokio::select! {
+                let pulled = tokio::select! {
                     _ = task_cancel.cancelled() => return,
-                    result = tokio::time::timeout(FETCH_TIMEOUT, fetch_from(issuer)) => {
+                    result = tokio::time::timeout(PULL_TIMEOUT, pull_from(issuer)) => {
                         result.is_ok_and(|result| result)
                     },
                 };
                 let current_expiry = snapshot().renewal_targets(audience).into_iter().find_map(
                     |(target, current_expiry)| (target == issuer).then_some(current_expiry),
                 );
-                if fetched && current_expiry.is_none_or(|current| current != expires_at) {
+                if pulled && current_expiry.is_none_or(|current| current != expires_at) {
                     retries.remove(&issuer);
                 } else {
-                    let delay = if fetched {
+                    let delay = if pulled {
                         INITIAL_RETRY_DELAY
                     } else {
                         retries.get(&issuer).map_or(INITIAL_RETRY_DELAY, |retry| {

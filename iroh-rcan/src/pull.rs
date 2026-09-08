@@ -1,4 +1,4 @@
-//! Authenticated one-shot delegation fetch over iroh.
+//! Authenticated one-shot delegation pull over iroh.
 
 use std::{collections::BTreeSet, fmt};
 
@@ -12,10 +12,13 @@ use rcan::Delegation;
 
 use crate::{MAX_DELEGATION_BYTES, Store};
 
-/// Errors produced by the delegation-fetch protocol.
+/// Errors produced by the delegation-pull protocol.
 #[stack_error(derive, add_meta)]
 #[non_exhaustive]
 pub enum Error {
+    /// The application could not select delegations.
+    #[error("application rejected pull")]
+    Application { source: n0_error::AnyError },
     /// The response contains more delegations than the protocol allows.
     #[error("too many delegations")]
     TooManyDelegations,
@@ -75,11 +78,11 @@ pub enum Error {
     InvalidDelegation { source: crate::StoreError },
 }
 
-/// Result returned by the delegation-fetch protocol.
+/// Result returned by the delegation-pull protocol.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// ALPN used by the delegation-fetch protocol.
-pub const ALPN: &[u8] = b"iroh-rcan/fetch/3";
+/// ALPN used by the delegation-pull protocol.
+pub const ALPN: &[u8] = b"iroh-rcan/pull/3";
 
 /// Maximum number of delegations returned by one request.
 pub const MAX_DELEGATIONS: usize = 128;
@@ -89,26 +92,27 @@ pub const MAX_RESPONSE_BYTES: usize = MAX_DELEGATIONS * MAX_DELEGATION_BYTES + 1
 
 /// Serves relevant delegations selected from the authenticated remote endpoint ID.
 #[derive(Clone)]
-pub struct FetchProtocol<F> {
+pub struct PullProtocol<F> {
     delegations_for: F,
 }
 
-impl<F> FetchProtocol<F> {
-    /// Creates a fetch handler.
+impl<F> PullProtocol<F> {
+    /// Creates a pull handler.
     pub fn new(delegations_for: F) -> Self {
         Self { delegations_for }
     }
 }
 
-impl<F> fmt::Debug for FetchProtocol<F> {
+impl<F> fmt::Debug for PullProtocol<F> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("FetchProtocol")
+        formatter.write_str("PullProtocol")
     }
 }
 
-impl<F> ProtocolHandler for FetchProtocol<F>
+impl<F, E> ProtocolHandler for PullProtocol<F>
 where
-    F: Fn(EndpointId) -> Result<Vec<Delegation>> + Send + Sync + 'static,
+    F: Fn(EndpointId) -> std::result::Result<Vec<Delegation>, E> + Send + Sync + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         serve(connection, &self.delegations_for)
@@ -117,12 +121,17 @@ where
     }
 }
 
-async fn serve(
+async fn serve<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
     connection: Connection,
-    delegations_for: impl FnOnce(EndpointId) -> Result<Vec<Delegation>>,
+    delegations_for: impl FnOnce(EndpointId) -> std::result::Result<Vec<Delegation>, E>,
 ) -> Result<()> {
     let requester = connection.remote_id();
-    let delegations = delegations_for(requester)?;
+    let delegations = delegations_for(requester).map_err(|error| {
+        e!(
+            Error::Application,
+            n0_error::AnyError::from_std_box(error.into())
+        )
+    })?;
     if delegations.len() > MAX_DELEGATIONS {
         return Err(e!(Error::TooManyDelegations));
     }
@@ -144,8 +153,8 @@ async fn serve(
     Ok(())
 }
 
-/// Fetches delegations relevant to this endpoint from `provider`.
-pub async fn fetch(
+/// Pulls delegations relevant to this endpoint from `provider`.
+pub async fn pull(
     endpoint: &Endpoint,
     provider: impl Into<EndpointAddr>,
 ) -> Result<Vec<Delegation>> {
@@ -201,7 +210,7 @@ mod tests {
     use rcan::{Delegation, Expires};
     use serde::{Deserialize, Serialize};
 
-    use super::{ALPN, FetchProtocol, fetch};
+    use super::{ALPN, PullProtocol, pull};
     use crate::Store;
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,7 +228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_uses_the_authenticated_requester() {
+    async fn pull_uses_the_authenticated_requester() {
         let owner_key = SecretKey::from_bytes(&[1; 32]);
         let provider_key = SecretKey::from_bytes(&[2; 32]);
         let client_key = SecretKey::from_bytes(&[3; 32]);
@@ -242,12 +251,14 @@ mod tests {
         .sign(Expires::Never);
         let mut served = Store::default();
         served.insert(leaf.into_opaque()).unwrap();
-        let protocol = FetchProtocol::new(move |requester: iroh::EndpointId| {
-            Ok(served.relevant_delegations(requester.as_verifying_key()))
-        });
+        let protocol = PullProtocol::new(
+            move |requester: iroh::EndpointId| -> super::Result<Vec<Delegation>> {
+                Ok(served.relevant_delegations(requester.as_verifying_key()))
+            },
+        );
         let router = Router::builder(provider).accept(ALPN, protocol).spawn();
 
-        let delegations = fetch(&client, router.endpoint().addr()).await.unwrap();
+        let delegations = pull(&client, router.endpoint().addr()).await.unwrap();
         assert_eq!(delegations.len(), 1);
         let mut received = Store::default();
         received.insert(missing_root.into_opaque()).unwrap();
@@ -261,7 +272,7 @@ mod tests {
             1
         );
         assert!(
-            fetch(&other, router.endpoint().addr())
+            pull(&other, router.endpoint().addr())
                 .await
                 .unwrap()
                 .is_empty()

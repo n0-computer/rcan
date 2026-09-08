@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, ed25519::signature::Signer};
 use iroh::EndpointId;
 use n0_error::{e, stack_error};
-use rcan::{CapabilityEncoding, CapabilityOrigin, Delegation};
+use rcan::{Authorizer, Capability, CapabilityEncoding, CapabilityOrigin, Delegation};
+use serde::{Deserialize, Serialize};
 
-pub mod fetch;
+pub mod pull;
 pub mod push;
 pub mod renewal;
 
@@ -152,16 +153,112 @@ impl DelegationId {
 /// A signed statement permanently revoking one delegation.
 ///
 /// This type belongs in `rcan` once the format and error vocabulary settle.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Revocation {
     payload: RevocationPayload,
     signature: Signature,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct RevocationPayload {
     revoker: VerifyingKey,
     delegation: Delegation,
+}
+
+/// A signed revocation with a root-to-target delegation chain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthorizedRevocation {
+    /// The signed revocation.
+    pub revocation: Revocation,
+    /// The chain ending in the exact revoked delegation.
+    pub chain: Vec<Delegation>,
+}
+
+impl AuthorizedRevocation {
+    /// Checks the revoker's current authority against the receiver's known revocations.
+    pub fn authorize<C: Capability>(&self, store: &Store) -> Result<(), AuthorizationError> {
+        self.revocation
+            .verify()
+            .map_err(|source| e!(AuthorizationError::Signature, source))?;
+        let chain = DelegationChain::new(self.chain.clone())
+            .map_err(|source| e!(AuthorizationError::Chain, source))?;
+        let target = chain.delegations().last().expect("checked nonempty chain");
+        if target != self.revocation.delegation() {
+            return Err(e!(AuthorizationError::TargetMismatch));
+        }
+        let index = chain
+            .delegations()
+            .iter()
+            .position(|grant| grant.issuer() == self.revocation.revoker())
+            .ok_or_else(|| e!(AuthorizationError::NotUpstream))?;
+        let authority = chain.delegations()[..index]
+            .iter()
+            .cloned()
+            .map(|grant| grant.try_with_capability_type::<C>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| e!(AuthorizationError::Capability, source))?;
+        if !authority.is_empty() {
+            let prefix = DelegationChain::new(self.chain[..index].to_vec())
+                .map_err(|source| e!(AuthorizationError::Chain, source))?;
+            store
+                .check_revocations(&prefix)
+                .map_err(|source| e!(AuthorizationError::Revoked, source))?;
+        }
+        Authorizer::new(*target.capability_owner())
+            .check_invocation_from(
+                *self.revocation.revoker(),
+                C::decode(target.capability_bytes())
+                    .map_err(|source| e!(AuthorizationError::Capability, source))?,
+                &authority.iter().collect::<Vec<_>>(),
+            )
+            .map_err(|source| e!(AuthorizationError::Invocation, Box::new(source)))?;
+        Ok(())
+    }
+}
+
+/// Errors produced while authorizing a revocation.
+#[stack_error(derive, add_meta)]
+#[non_exhaustive]
+pub enum AuthorizationError {
+    /// The revocation signature is invalid.
+    #[error("invalid revocation signature")]
+    Signature {
+        #[error(std_err)]
+        source: ed25519_dalek::SignatureError,
+    },
+    /// The supplied chain is invalid.
+    #[error("invalid revocation chain")]
+    Chain { source: ChainError },
+    /// A capability cannot be decoded.
+    #[error("invalid revocation capability")]
+    Capability { source: rcan::DecodeError },
+    /// The revoker does not currently hold the required authority.
+    #[error("revocation is not authorized")]
+    Invocation {
+        #[error(std_err)]
+        source: Box<rcan::InvocationError>,
+    },
+    /// The revoker's authority was revoked.
+    #[error("revoker's authority was revoked")]
+    Revoked {
+        #[error(std_err)]
+        source: Revoked,
+    },
+    /// The chain does not end in the revoked delegation.
+    #[error("revocation target differs from chain")]
+    TargetMismatch,
+    /// The revoker is not an issuer upstream of the target.
+    #[error("revoker is not an upstream issuer")]
+    NotUpstream,
+}
+
+/// Delegations and revocations delivered together.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StoreBatch {
+    /// Delegations relevant to the receiver.
+    pub delegations: Vec<Delegation>,
+    /// Revocations with their authorization chains.
+    pub revocations: Vec<AuthorizedRevocation>,
 }
 
 impl Revocation {
@@ -692,6 +789,65 @@ mod tests {
     enum TestCapability {
         All,
         Service(u8),
+    }
+
+    impl rcan::Capability for TestCapability {
+        fn permits(&self, other: &Self) -> bool {
+            matches!(self, Self::All) || self == other
+        }
+    }
+
+    #[test]
+    fn revocation_requires_current_revoker_authority() {
+        let owner = key(40);
+        let bob = key(41);
+        let carol = key(42);
+        let cap = TestCapability::Service(1);
+        let root = |expiry, capability: &TestCapability| {
+            Delegation::issuing_builder(&owner, bob.verifying_key(), capability)
+                .sign(expiry)
+                .into_opaque()
+        };
+        let target = Delegation::delegating_builder(
+            &bob,
+            carol.verifying_key(),
+            owner.verifying_key(),
+            &cap,
+        )
+        .sign(Expires::At(1))
+        .into_opaque();
+        let mut authorized = super::AuthorizedRevocation {
+            revocation: Revocation::new(&bob, target.clone()),
+            chain: vec![root(Expires::Never, &cap), target.clone()],
+        };
+        let mut store = Store::default();
+        // Target expiry does not remove Bob's authority to revoke it.
+        authorized.authorize::<TestCapability>(&store).unwrap();
+        store
+            .insert_revocation(authorized.revocation.clone())
+            .unwrap();
+        authorized.authorize::<TestCapability>(&store).unwrap();
+
+        authorized.chain[0] = root(Expires::At(1), &cap);
+        assert!(authorized.authorize::<TestCapability>(&store).is_err());
+        authorized.chain[0] = root(Expires::Never, &TestCapability::Service(2));
+        assert!(authorized.authorize::<TestCapability>(&store).is_err());
+        authorized.chain[0] = root(Expires::Never, &cap);
+        authorized.revocation = Revocation::new(&carol, target.clone());
+        assert!(authorized.authorize::<TestCapability>(&store).is_err());
+        authorized.revocation = Revocation::new(&bob, authorized.chain[0].clone());
+        assert!(authorized.authorize::<TestCapability>(&store).is_err());
+        authorized.revocation = Revocation::new(&bob, target.clone());
+        store
+            .insert_revocation(Revocation::new(&owner, authorized.chain[0].clone()))
+            .unwrap();
+        assert!(authorized.authorize::<TestCapability>(&store).is_err());
+
+        // Alice needs no grant, even when Bob's authority is revoked.
+        authorized.revocation = Revocation::new(&owner, target);
+        authorized.authorize::<TestCapability>(&store).unwrap();
+        authorized.revocation.signature = Signature::from_bytes(&[0; 64]);
+        assert!(authorized.authorize::<TestCapability>(&store).is_err());
     }
 
     fn key(byte: u8) -> SigningKey {

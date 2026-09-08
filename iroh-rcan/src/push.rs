@@ -1,4 +1,4 @@
-//! Authenticated one-shot delegation delivery over iroh.
+//! Authenticated one-shot delegation and revocation delivery over iroh.
 
 use std::{collections::BTreeSet, fmt};
 
@@ -11,14 +11,32 @@ use n0_error::{e, stack_error};
 use rcan::Delegation;
 
 use crate::{
-    Store,
-    fetch::{MAX_DELEGATIONS, MAX_RESPONSE_BYTES},
+    DelegationChain, DelegationId, Store, StoreBatch,
+    pull::{MAX_DELEGATIONS, MAX_RESPONSE_BYTES},
 };
 
 /// Errors produced by the delegation-push protocol.
 #[stack_error(derive, add_meta)]
 #[non_exhaustive]
 pub enum Error {
+    /// The application rejected the batch.
+    #[error("application rejected push")]
+    Application { source: n0_error::AnyError },
+    /// A revocation's chain is invalid.
+    #[error("invalid revocation chain")]
+    InvalidChain { source: crate::ChainError },
+    /// The chain does not end in the target delegation.
+    #[error("revocation target differs from chain")]
+    TargetMismatch,
+    /// A revocation occurs more than once.
+    #[error("duplicate revocation")]
+    DuplicateRevocation,
+    /// A revocation is unrelated to the receiver.
+    #[error("unrelated revocation")]
+    UnrelatedRevocation,
+    /// The request contains too many revocations.
+    #[error("too many revocations")]
+    TooManyRevocations,
     /// The request contains more delegations than the protocol allows.
     #[error("too many delegations")]
     TooManyDelegations,
@@ -85,9 +103,12 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// ALPN used by the delegation-push protocol.
-pub const ALPN: &[u8] = b"iroh-rcan/push/2";
+pub const ALPN: &[u8] = b"iroh-rcan/push/3";
 
-/// Receives delegations for this endpoint and passes them to the application.
+/// Receives relevant delegations and revocations for this endpoint.
+///
+/// The callback must authorize revocations in its capability vocabulary before applying the batch.
+/// Structural bounds, signatures, and receiver relevance are checked by the protocol.
 #[derive(Clone)]
 pub struct PushProtocol<F> {
     audience: EndpointId,
@@ -107,9 +128,10 @@ impl<F> fmt::Debug for PushProtocol<F> {
     }
 }
 
-impl<F> ProtocolHandler for PushProtocol<F>
+impl<F, E> ProtocolHandler for PushProtocol<F>
 where
-    F: Fn(EndpointId, Vec<Delegation>) -> Result<()> + Send + Sync + 'static,
+    F: Fn(EndpointId, StoreBatch) -> std::result::Result<(), E> + Send + Sync + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         receive(connection, self.audience, &self.receive)
@@ -118,10 +140,10 @@ where
     }
 }
 
-async fn receive(
+async fn receive<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
     connection: Connection,
     audience: EndpointId,
-    receive: impl FnOnce(EndpointId, Vec<Delegation>) -> Result<()>,
+    receive: impl FnOnce(EndpointId, StoreBatch) -> std::result::Result<(), E>,
 ) -> Result<()> {
     let sender = connection.remote_id();
     let mut recv = connection
@@ -132,8 +154,13 @@ async fn receive(
         .read_to_end(MAX_RESPONSE_BYTES)
         .await
         .map_err(|source| e!(Error::ReadStream, source))?;
-    let delegations = decode_relevant(&request, audience)?;
-    receive(sender, delegations)?;
+    let batch = decode_relevant(&request, audience)?;
+    receive(sender, batch).map_err(|error| {
+        e!(
+            Error::Application,
+            n0_error::AnyError::from_std_box(error.into())
+        )
+    })?;
     let mut send = connection
         .open_uni()
         .await
@@ -147,16 +174,15 @@ async fn receive(
     Ok(())
 }
 
-/// Delivers delegations to `audience` and returns after the receiver acknowledges them.
+/// Delivers a batch to `audience` and waits for the receiver to acknowledge it.
 pub async fn push(
     endpoint: &Endpoint,
     audience: impl Into<EndpointAddr>,
-    delegations: Vec<Delegation>,
+    batch: StoreBatch,
 ) -> Result<()> {
     let audience = audience.into();
-    validate_relevant(&delegations, audience.id)?;
-    let request =
-        postcard::to_stdvec(&delegations).map_err(|source| e!(Error::EncodeRequest, source))?;
+    validate_relevant(&batch, audience.id)?;
+    let request = postcard::to_stdvec(&batch).map_err(|source| e!(Error::EncodeRequest, source))?;
     if request.len() > MAX_RESPONSE_BYTES {
         return Err(e!(Error::RequestTooLarge));
     }
@@ -184,18 +210,22 @@ pub async fn push(
     if acknowledgement != [0] {
         return Err(e!(Error::InvalidAcknowledgement));
     }
-    connection.close(0u32.into(), b"delegations acknowledged");
+    connection.close(0u32.into(), b"batch acknowledged");
     Ok(())
 }
 
-fn decode_relevant(bytes: &[u8], audience: EndpointId) -> Result<Vec<Delegation>> {
-    let delegations: Vec<Delegation> =
+fn decode_relevant(bytes: &[u8], audience: EndpointId) -> Result<StoreBatch> {
+    let batch: StoreBatch =
         postcard::from_bytes(bytes).map_err(|source| e!(Error::DecodeRequest, source))?;
-    validate_relevant(&delegations, audience)?;
-    Ok(delegations)
+    validate_relevant(&batch, audience)?;
+    Ok(batch)
 }
 
-fn validate_relevant(delegations: &[Delegation], audience: EndpointId) -> Result<()> {
+fn validate_relevant(batch: &StoreBatch, audience: EndpointId) -> Result<()> {
+    let delegations = &batch.delegations;
+    if batch.revocations.len() > MAX_DELEGATIONS {
+        return Err(e!(Error::TooManyRevocations));
+    }
     if delegations.len() > MAX_DELEGATIONS {
         return Err(e!(Error::TooManyDelegations));
     }
@@ -219,6 +249,41 @@ fn validate_relevant(delegations: &[Delegation], audience: EndpointId) -> Result
         .collect::<BTreeSet<_>>();
     if received != relevant {
         return Err(e!(Error::UnrelatedDelegation));
+    }
+    let mut targets = BTreeSet::new();
+    for authorized in &batch.revocations {
+        let chain = DelegationChain::new(authorized.chain.clone())
+            .map_err(|source| e!(Error::InvalidChain, source))?;
+        if chain.delegations().last() != Some(authorized.revocation.delegation()) {
+            return Err(e!(Error::TargetMismatch));
+        }
+        if !targets.insert((
+            DelegationId::new(authorized.revocation.delegation()),
+            authorized.revocation.revoker().to_bytes(),
+        )) {
+            return Err(e!(Error::DuplicateRevocation));
+        }
+        store
+            .insert_revocation(authorized.revocation.clone())
+            .map_err(|source| e!(Error::InvalidDelegation, source))?;
+        for grant in chain.delegations() {
+            store
+                .insert(grant.clone())
+                .map_err(|source| e!(Error::InvalidDelegation, source))?;
+        }
+    }
+    let relevant = store
+        .relevant_delegations(audience.as_verifying_key())
+        .iter()
+        .map(DelegationId::new)
+        .collect::<BTreeSet<_>>();
+    for authorized in &batch.revocations {
+        let target = authorized.revocation.delegation();
+        if target.capability_owner() != &audience.as_verifying_key()
+            && !relevant.contains(&DelegationId::new(target))
+        {
+            return Err(e!(Error::UnrelatedRevocation));
+        }
     }
     Ok(())
 }
@@ -276,21 +341,27 @@ mod tests {
         .sign(Expires::Never);
         let received = Arc::new(RwLock::new(Store::default()));
         let target = received.clone();
-        let protocol = PushProtocol::new(receiver.id(), move |_sender, delegations| {
-            let mut store = target.write().unwrap();
-            for delegation in delegations {
-                store
-                    .insert(delegation)
-                    .map_err(|source| e!(Error::InvalidDelegation, source))?;
-            }
-            Ok(())
-        });
+        let protocol = PushProtocol::new(
+            receiver.id(),
+            move |_sender, batch: crate::StoreBatch| -> super::Result<()> {
+                let mut store = target.write().unwrap();
+                for delegation in batch.delegations {
+                    store
+                        .insert(delegation)
+                        .map_err(|source| e!(Error::InvalidDelegation, source))?;
+                }
+                Ok(())
+            },
+        );
         let router = Router::builder(receiver).accept(ALPN, protocol).spawn();
 
         push(
             &sender,
             router.endpoint().addr(),
-            vec![root.clone().into_opaque(), leaf.into_opaque()],
+            crate::StoreBatch {
+                delegations: vec![root.clone().into_opaque(), leaf.into_opaque()],
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -303,9 +374,16 @@ mod tests {
             1
         );
         assert!(
-            push(&sender, other.addr(), vec![root.into_opaque()],)
-                .await
-                .is_err()
+            push(
+                &sender,
+                other.addr(),
+                crate::StoreBatch {
+                    delegations: vec![root.into_opaque()],
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
         );
 
         sender.close().await;
