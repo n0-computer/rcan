@@ -30,7 +30,7 @@ jobs:
           node-version: 22.5
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: stable
 
@@ -38,7 +38,7 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
+        uses: cargo-bins/cargo-binstall@422f3094be6a0843857aa008b499caaf6bce0da8 # v1.24.0
 
       - name: Install wasm-bindgen-test-runner
         run: cargo binstall wasm-bindgen-cli --locked --no-confirm
