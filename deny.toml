@@ -1,4 +1,5 @@
 [advisories]
+yanked = "deny"
 ignore = [
     "RUSTSEC-2023-0089",
 ]
@@ -16,6 +17,7 @@ multiple-versions = "allow"
 [licenses]
 allow = [
     "Apache-2.0",
+    "BSD-2-Clause",
     "BSD-3-Clause",
     "MIT",
     "Unicode-3.0",
@@ -29,5 +31,3 @@ name = "ring"
 [[licenses.clarify.license-files]]
 hash = 3171872035
 path = "LICENSE"
-
-[sources]
