@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "rcan"
-version = "0.5.0"
+version = "0.4.1"
 dependencies = [
  "assert_matches",
  "data-encoding",
