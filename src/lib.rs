@@ -14,6 +14,7 @@ use ed25519_dalek::{
 use n0_error::{e, stack_error};
 use n0_future::time::{Duration, SystemTime};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use smallvec::SmallVec;
 
 #[cfg(test)]
 mod tests;
@@ -47,7 +48,7 @@ pub struct Delegation<C = OpaqueCapability> {
     capability_origin: CapabilityOrigin,
     valid_until: Expires,
     /// The exact capability representation used by the signed payload.
-    capability_bytes: Vec<u8>,
+    capability_bytes: SmallVec<[u8; 32]>,
     signature: Signature,
     capability_type: std::marker::PhantomData<C>,
 }
@@ -58,7 +59,7 @@ impl<C> Delegation<C> {
         audience: VerifyingKey,
         capability_origin: CapabilityOrigin,
         valid_until: Expires,
-        capability_bytes: Vec<u8>,
+        capability_bytes: SmallVec<[u8; 32]>,
         signature: Signature,
     ) -> Self {
         Self {
@@ -164,16 +165,27 @@ impl<C> Delegation<C> {
 
     /// Returns the delegation's byte encoding.
     pub fn encode(&self) -> Vec<u8> {
-        let mut res = vec![2u8];
-        encode_body(self, &mut res);
-        res.extend_from_slice(&self.signature.to_bytes());
-        res
+        let mut bytes = SmallVec::<[u8; 192]>::new();
+        self.encode_into(&mut bytes);
+        bytes.into_vec()
+    }
+
+    /// Appends the delegation's byte encoding to `out`.
+    ///
+    /// This is identical to [`encode`](Delegation::encode) but avoids an
+    /// allocation when the caller can provide a buffer.
+    pub fn encode_into(&self, out: &mut impl Extend<u8>) {
+        out.extend(std::iter::once(2));
+        encode_body(self, out);
+        out.extend(self.signature.to_bytes());
     }
 
     /// Returns a lowercase base32 string of the delegation's byte encoding,
     /// useful for compact, printable representations.
     pub fn encode_string(&self) -> String {
-        BASE32_LOWER_NOPAD.encode(&self.encode())
+        let mut bytes = SmallVec::<[u8; 192]>::new();
+        self.encode_into(&mut bytes);
+        BASE32_LOWER_NOPAD.encode(&bytes)
     }
 }
 
@@ -218,7 +230,8 @@ impl<C: CapabilityEncoding> Delegation<C> {
         capability: &C,
         valid_until: Expires,
     ) -> Self {
-        let capability_bytes = C::encode(capability);
+        let mut capability_bytes = SmallVec::<[u8; 32]>::new();
+        capability.encode_into(&mut capability_bytes);
         let delegation = Delegation::new(
             issuer.verifying_key(),
             audience,
@@ -227,7 +240,7 @@ impl<C: CapabilityEncoding> Delegation<C> {
             capability_bytes,
             Signature::from_bytes(&[0u8; 64]),
         );
-        let mut to_sign = DST.to_vec();
+        let mut to_sign = SmallVec::<[u8; 192]>::from_slice(DST);
         encode_body(&delegation, &mut to_sign);
         let signature = issuer.sign(&to_sign);
         Delegation {
@@ -266,21 +279,28 @@ impl<C: CapabilityEncoding> Delegation<C> {
     /// Decodes a delegation from a base32 string, verifying the signature and
     /// decoding the capability as `C`. See [`decode`](Delegation::decode).
     pub fn decode_string(s: &str) -> Result<Self, DecodeError> {
-        let bytes = BASE32_LOWER_NOPAD
-            .decode(s.as_bytes())
+        let len = BASE32_LOWER_NOPAD
+            .decode_len(s.len())
             .map_err(DecodeError::malformed)?;
+        let mut bytes = SmallVec::<[u8; 192]>::new();
+        bytes.resize(len, 0);
+        let len = BASE32_LOWER_NOPAD
+            .decode_mut(s.as_bytes(), &mut bytes)
+            .map_err(|error| DecodeError::malformed(error.error))?;
+        bytes.truncate(len);
         Self::decode(&bytes)
     }
 }
 
 /// Serializes the delegation as its byte encoding, or as a base32 string when
-/// the format is human-readable. See [`Delegation::encode`].
+/// the format is human-readable. See [`Delegation::encode_into`].
 impl<C> Serialize for Delegation<C> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
             serializer.serialize_str(&self.encode_string())
         } else {
-            let bytes = self.encode();
+            let mut bytes = SmallVec::<[u8; 192]>::new();
+            self.encode_into(&mut bytes);
             serde_bytes::Bytes::new(&bytes).serialize(serializer)
         }
     }
@@ -306,7 +326,7 @@ impl<'de, C: CapabilityEncoding> Deserialize<'de> for Delegation<C> {
 /// This is the default capability type of a [`Delegation`]: a delegation whose
 /// capability is not (yet) known. Any byte string is a valid `OpaqueCapability`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpaqueCapability(Vec<u8>);
+pub struct OpaqueCapability(SmallVec<[u8; 32]>);
 
 impl OpaqueCapability {
     /// Returns the underlying capability bytes.
@@ -316,12 +336,12 @@ impl OpaqueCapability {
 }
 
 impl CapabilityEncoding for OpaqueCapability {
-    fn encode(&self) -> Vec<u8> {
-        self.0.clone()
+    fn encode_into(&self, out: &mut impl Extend<u8>) {
+        out.extend(self.0.iter().copied());
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        Ok(Self(bytes.to_vec()))
+        Ok(Self(SmallVec::from_slice(bytes)))
     }
 }
 
@@ -492,8 +512,9 @@ impl Authorizer {
 /// implement this yourself: any [`Serialize`] + [`Deserialize`] type is
 /// supported automatically.
 pub trait CapabilityEncoding {
-    /// Returns the bytes this capability is represented as inside a delegation.
-    fn encode(&self) -> Vec<u8>;
+    /// Appends the bytes representing this capability inside a delegation to
+    /// `out`.
+    fn encode_into(&self, out: &mut impl Extend<u8>);
 
     /// Decodes a capability from its bytes.
     ///
@@ -506,9 +527,17 @@ pub trait CapabilityEncoding {
         Self: Sized;
 }
 
+struct ExtendRef<'a, T>(&'a mut T);
+
+impl<T: Extend<u8>> Extend<u8> for ExtendRef<'_, T> {
+    fn extend<I: IntoIterator<Item = u8>>(&mut self, iter: I) {
+        self.0.extend(iter);
+    }
+}
+
 impl<T: Serialize + DeserializeOwned> CapabilityEncoding for T {
-    fn encode(&self) -> Vec<u8> {
-        postcard::to_stdvec(self).expect("capability serializes")
+    fn encode_into(&self, out: &mut impl Extend<u8>) {
+        postcard::to_extend(self, ExtendRef(out)).expect("capability serializes");
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
@@ -593,14 +622,14 @@ pub(crate) const BASE32_LOWER_NOPAD: data_encoding::Encoding = data_encoding_mac
     symbols: "abcdefghijklmnopqrstuvwxyz234567",
 );
 
-fn encode_body<C>(delegation: &Delegation<C>, out: &mut Vec<u8>) {
-    out.extend_from_slice(delegation.issuer.as_bytes());
-    out.extend_from_slice(delegation.audience.as_bytes());
+fn encode_body<C>(delegation: &Delegation<C>, out: &mut impl Extend<u8>) {
+    out.extend(delegation.issuer.as_bytes().iter().copied());
+    out.extend(delegation.audience.as_bytes().iter().copied());
     match &delegation.capability_origin {
         CapabilityOrigin::Issuer => write_varint(0, out),
         CapabilityOrigin::Delegation(root) => {
             write_varint(1, out);
-            out.extend_from_slice(root.as_bytes());
+            out.extend(root.as_bytes().iter().copied());
         }
     }
     match &delegation.valid_until {
@@ -611,7 +640,7 @@ fn encode_body<C>(delegation: &Delegation<C>, out: &mut Vec<u8>) {
         }
     }
     write_varint(delegation.capability_bytes.len() as u64, out);
-    out.extend_from_slice(&delegation.capability_bytes);
+    out.extend(delegation.capability_bytes.iter().copied());
 }
 
 fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C>, DecodeError> {
@@ -629,7 +658,7 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
             .try_into()
             .map_err(|_| DecodeError::malformed("invalid signature length"))?,
     );
-    let mut to_verify = DST.to_vec();
+    let mut to_verify = SmallVec::<[u8; 192]>::from_slice(DST);
     to_verify.extend_from_slice(body_bytes);
     delegation
         .issuer
@@ -666,7 +695,7 @@ fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, 
         .map_err(|_| DecodeError::malformed("capability length overflow"))?;
     let cap_bytes = take_bytes(buf, cap_len)?;
     C::decode(cap_bytes)?;
-    let capability_bytes = cap_bytes.to_vec();
+    let capability_bytes = SmallVec::from_slice(cap_bytes);
 
     Ok(Delegation::new(
         issuer,
@@ -700,10 +729,10 @@ fn take_key(buf: &mut &[u8]) -> Result<VerifyingKey, DecodeError> {
 }
 
 /// Appends postcard's canonical varint encoding of `value` to `out`.
-fn write_varint(value: u64, out: &mut Vec<u8>) {
+fn write_varint(value: u64, out: &mut impl Extend<u8>) {
     let mut buf = [0u8; 10];
     let encoded = postcard::to_slice(&value, &mut buf).expect("u64 fits in ten bytes");
-    out.extend_from_slice(encoded);
+    out.extend(encoded.iter().copied());
 }
 
 /// Takes one canonically postcard-encoded `u64` from the front of `buf`.

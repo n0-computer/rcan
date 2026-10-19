@@ -24,6 +24,7 @@ n0-future = "0.3.2"
 postcard = { version = "1.1.1", features = ["use-std"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_bytes = "0.11"
+smallvec = { version = "1", features = ["const_generics"] }
 
 [dev-dependencies]
 assert_matches = "1.5.0"
