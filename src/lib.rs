@@ -93,11 +93,13 @@ impl<C> Delegation<C> {
         &self.capability_origin
     }
 
-    /// Returns the public key of the principal that owns the capability.
-    pub fn capability_owner(&self) -> &VerifyingKey {
+    /// Returns the public key of the principal that owns the capability, or
+    /// `None` for an auto-delegation, which has no owner.
+    pub fn capability_owner(&self) -> Option<&VerifyingKey> {
         match &self.capability_origin {
-            CapabilityOrigin::Issuer => &self.issuer,
-            CapabilityOrigin::Delegation(root) => root,
+            CapabilityOrigin::Issuer => Some(&self.issuer),
+            CapabilityOrigin::Delegation(root) => Some(root),
+            CapabilityOrigin::Auto => None,
         }
     }
 
@@ -218,6 +220,33 @@ impl<C: CapabilityEncoding> Delegation<C> {
             issuer,
             audience,
             CapabilityOrigin::Delegation(owner),
+            capability,
+            valid_until,
+        )
+    }
+
+    /// Forwards any capabilities matching `capability` that `issuer` is granted to `audience`.
+    ///
+    /// The critical difference to normal delegations is that this delegates without
+    /// referring to a specific root owner of the capability.
+    /// This allows pre-issuing an auto-delegation to another principal ahead of
+    /// actually receiving or knowing the delegations that the issuer attains in
+    /// the future.
+    ///
+    /// Use this to implement cold keys or identity abstractions over devices.
+    ///
+    /// Each authorizer decodes `capability` with its own capability type,
+    /// so it can only be used this with owners that agree on `C`'s encoding.
+    pub fn auto_delegate(
+        issuer: &SigningKey,
+        audience: VerifyingKey,
+        capability: &C,
+        valid_until: Expires,
+    ) -> Self {
+        Self::sign(
+            issuer,
+            audience,
+            CapabilityOrigin::Auto,
             capability,
             valid_until,
         )
@@ -358,6 +387,9 @@ pub enum CapabilityOrigin {
     Issuer,
     /// The capability was previously granted by this root principal.
     Delegation(VerifyingKey),
+    /// The capability may originate with any principal. See
+    /// [`Delegation::auto_delegate`].
+    Auto,
 }
 
 /// When a delegation expires.
@@ -486,7 +518,12 @@ impl Authorizer {
                     expiry: proof.expires().clone(),
                 }));
             }
-            if proof.capability_owner() != &self.principal {
+            // Auto-delegations have no owner. The chain still has to start at the principal,
+            // which makes it the owner.
+            if proof
+                .capability_owner()
+                .is_some_and(|owner| owner != &self.principal)
+            {
                 return Err(e!(InvocationError::CapabilityOwnerMismatch {
                     authorizer: self.principal,
                 }));
@@ -631,6 +668,7 @@ fn encode_body<C>(delegation: &Delegation<C>, out: &mut impl Extend<u8>) {
             write_varint(1, out);
             out.extend(root.as_bytes().iter().copied());
         }
+        CapabilityOrigin::Auto => write_varint(2, out),
     }
     match &delegation.valid_until {
         Expires::Never => write_varint(0, out),
@@ -680,10 +718,11 @@ fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, 
     let capability_origin = match take_varint(buf)? {
         0 => CapabilityOrigin::Issuer,
         1 => CapabilityOrigin::Delegation(take_key(buf)?),
+        2 => CapabilityOrigin::Auto,
         tag => {
             return Err(DecodeError::malformed(format!(
                 "unknown capability origin tag {tag}"
-            )))
+            )));
         }
     };
     let valid_until = match take_varint(buf)? {
