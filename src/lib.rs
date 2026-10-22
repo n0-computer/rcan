@@ -225,10 +225,16 @@ impl<C: CapabilityEncoding> Delegation<C> {
         )
     }
 
-    /// Delegates `capability` to `audience` without stating an owner.
+    /// Forwards any capabilities matching `capability` that `issuer` is granted to `audience`.
     ///
-    /// The delegation applies to every capability owner whose chain reaches
-    /// `issuer`, including grants `issuer` receives later.
+    /// The critical difference to normal delegations is that this delegates without
+    /// referring to a specific root owner of the capability.
+    /// This allows pre-issuing an auto-delegation to another principal ahead of
+    /// actually receiving or knowing the delegations that the issuer attains in
+    /// the future.
+    ///
+    /// Use this to implement cold keys or identity abstractions over devices.
+    ///
     /// Each authorizer decodes `capability` with its own capability type,
     /// so it can only be used this with owners that agree on `C`'s encoding.
     pub fn auto_delegate(
