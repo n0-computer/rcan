@@ -75,6 +75,17 @@ const V2_NEVER: &str = "
     7e2d4944846a0689ad5c6f89f9cff7283836f78633dd95e896aaa73fd28a490e
 ";
 
+const V2_AUTO: &str = "
+    02                                                               // version: v2
+    3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 // issuer: key(0)
+    8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c // audience: key(1)
+    02                                                               // capability origin: auto
+    00                                                               // valid until: never
+    01 00                                                            // capability: 1 byte, Rpc::Read
+    f7b43fb45dd122f8649db99ecd3ad0fefeb28dddb5ce1d98ae1ddc7f3312fee8 // signature
+    ab0053a4743e76e5150d76672f6c69746a82444ff799983f6419c66e7144ca0b
+";
+
 const V2_STRING: &str = "ai5wuj54z23killcuounaktpbvzwkmqvo4o6eq5ghlaerimllhnctcui4poxicprsx6vfwznhs5f24wkm4e36hmucin7g5eiag2a6324aaaybluzuqhqcamdiymin4km36ulfvqovkz44aajq5q2uk57rxicraqp2vbbdpzmzlgpyy2sij3awha5buorzgeugvlpojob4ld63tmugzlgbznpskpqm";
 
 #[test]
@@ -91,7 +102,7 @@ fn wire_snapshots() {
     assert_eq!(v2.issuer(), &key(0).verifying_key());
     assert_eq!(v2.audience(), &key(1).verifying_key());
     assert_eq!(v2.expires(), &Expires::At(4_102_444_800));
-    assert_eq!(v2.capability_owner(), &key(0).verifying_key());
+    assert_eq!(v2.capability_owner(), Some(&key(0).verifying_key()));
     assert_eq!(v2.capability(), Rpc::ReadWrite);
 
     let never = Delegation::issue(&key(0), key(1).verifying_key(), &Rpc::All, Expires::Never);
@@ -100,6 +111,12 @@ fn wire_snapshots() {
         Delegation::<Rpc>::decode(&hexdump(V2_NEVER)).unwrap(),
         never
     );
+
+    let auto =
+        Delegation::auto_delegate(&key(0), key(1).verifying_key(), &Rpc::Read, Expires::Never);
+    assert_eq!(hex::encode(auto.encode()), hex::encode(hexdump(V2_AUTO)));
+    assert_eq!(Delegation::<Rpc>::decode(&hexdump(V2_AUTO)).unwrap(), auto);
+    assert_eq!(auto.capability_owner(), None);
 
     let opaque = Delegation::decode(&bytes).unwrap();
     assert_eq!(opaque, v2.into_opaque());
@@ -171,6 +188,14 @@ fn v2_decode_rejects_tampering() {
     assert_eq!(widened[capability_offset], 0);
     widened[capability_offset] = 2;
     let err = Delegation::<Rpc>::decode(&widened).unwrap_err();
+    assert_matches!(err, DecodeError::InvalidSignature { .. });
+
+    // Rewriting the origin to auto would extend the grant to every owner.
+    let mut unbound = good.clone();
+    let origin_offset = 1 + 32 + 32;
+    assert_eq!(unbound[origin_offset], 0);
+    unbound[origin_offset] = 2;
+    let err = Delegation::<Rpc>::decode(&unbound).unwrap_err();
     assert_matches!(err, DecodeError::InvalidSignature { .. });
 
     let mut padded = good.clone();
@@ -385,4 +410,65 @@ fn owner_needs_no_chain() {
         .unwrap_err();
     assert_matches!(&err, InvocationError::InvokerMismatch { invoker, chain_end, .. }
         if invoker == &key(1).verifying_key() && chain_end == &service.verifying_key());
+}
+
+#[test]
+fn auto_delegation_applies_to_any_owner() {
+    let service = key(0);
+    let alice = key(1);
+    let bob = key(2);
+    let other_service = key(3);
+
+    // One auto-delegation passes on Alice's grants from every owner.
+    let auto = Delegation::auto_delegate(&alice, bob.verifying_key(), &Rpc::Read, Expires::Never);
+    for owner in [&service, &other_service] {
+        let grant = Delegation::issue(owner, alice.verifying_key(), &Rpc::All, Expires::Never);
+        let authorizer = Authorizer::new(owner.verifying_key());
+        authorizer
+            .check_invocation_from(bob.verifying_key(), Rpc::Read, &[&grant, &auto])
+            .unwrap();
+        // Only the owner constraint is dropped; the capability still attenuates.
+        let err = authorizer
+            .check_invocation_from(bob.verifying_key(), Rpc::ReadWrite, &[&grant, &auto])
+            .unwrap_err();
+        assert_matches!(err, InvocationError::NotPermitted { .. });
+    }
+
+    // The other links in the chain are still checked for their owner.
+    let foreign = Delegation::delegate(
+        &service,
+        alice.verifying_key(),
+        other_service.verifying_key(),
+        &Rpc::All,
+        Expires::Never,
+    );
+    let err = Authorizer::new(service.verifying_key())
+        .check_invocation_from(bob.verifying_key(), Rpc::Read, &[&foreign, &auto])
+        .unwrap_err();
+    assert_matches!(&err, InvocationError::CapabilityOwnerMismatch { authorizer, .. }
+        if authorizer == &service.verifying_key());
+}
+
+#[test]
+fn auto_delegation_at_chain_start() {
+    let service = key(0);
+    let alice = key(1);
+    let bob = key(2);
+    let authorizer = Authorizer::new(service.verifying_key());
+
+    // The chain starts at the principal, which makes it the owner.
+    let root =
+        Delegation::auto_delegate(&service, alice.verifying_key(), &Rpc::All, Expires::Never);
+    authorizer
+        .check_invocation_from(alice.verifying_key(), Rpc::Read, &[&root])
+        .unwrap();
+
+    // Setting no owner does not let anyone else start a chain.
+    let alice_root =
+        Delegation::auto_delegate(&alice, bob.verifying_key(), &Rpc::All, Expires::Never);
+    let err = authorizer
+        .check_invocation_from(bob.verifying_key(), Rpc::Read, &[&alice_root])
+        .unwrap_err();
+    assert_matches!(&err, InvocationError::ChainBroken { expected, found, .. }
+        if expected == &service.verifying_key() && found == &alice.verifying_key());
 }
