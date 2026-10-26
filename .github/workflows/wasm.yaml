@@ -25,12 +25,12 @@ jobs:
           persist-credentials: false
 
       - name: Setup node.js version 22.5 # needed for browser-like websocket API support in node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22.5
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
 
@@ -38,7 +38,7 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
+        uses: cargo-bins/cargo-binstall@8a2045612414e945291083f820cd50b4d8fc2218 # v1.26.0
 
       - name: Install wasm-bindgen-test-runner
         run: cargo binstall wasm-bindgen-cli --locked --no-confirm
