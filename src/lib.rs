@@ -189,6 +189,22 @@ impl<C> Delegation<C> {
         self.encode_into(&mut bytes);
         BASE32_LOWER_NOPAD.encode(&bytes)
     }
+
+    /// Returns the message that the issuer signs.
+    ///
+    /// The message is [`DST`] followed by the payload. The payload is the byte
+    /// encoding without the leading version byte and the trailing signature.
+    /// Use it to verify the signature with other code, or to derive an id of
+    /// the signed content that does not change when the issuer signs again.
+    pub fn signed_message(&self) -> Vec<u8> {
+        self.message().into_vec()
+    }
+
+    fn message(&self) -> SmallVec<[u8; 192]> {
+        let mut message = SmallVec::from_slice(DST);
+        encode_body(self, &mut message);
+        message
+    }
 }
 
 impl<C: CapabilityEncoding> Delegation<C> {
@@ -269,9 +285,7 @@ impl<C: CapabilityEncoding> Delegation<C> {
             capability_bytes,
             Signature::from_bytes(&[0u8; 64]),
         );
-        let mut to_sign = SmallVec::<[u8; 192]>::from_slice(DST);
-        encode_body(&delegation, &mut to_sign);
-        let signature = issuer.sign(&to_sign);
+        let signature = issuer.sign(&delegation.message());
         Delegation {
             signature,
             ..delegation
@@ -294,10 +308,45 @@ impl<C: CapabilityEncoding> Delegation<C> {
     /// and other [`DecodeError`]s if the token is malformed or its signature is
     /// invalid.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::decode_unverified(bytes)?.verify()
+    }
+
+    /// Decodes a delegation without verifying its signature.
+    ///
+    /// This runs every check of [`decode`] except the signature check, and
+    /// decodes the capability as `C`. Call [`verify`] to check the signature.
+    /// Your own checks on the issuer or the capability can run first, so a
+    /// delegation that they refuse costs no signature check. For bytes that
+    /// you verified before, for example delegations in your own store, the
+    /// getters of [`UnverifiedDelegation`] give the fields without any check.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`decode`], except
+    /// [`DecodeError::InvalidSignature`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ed25519_dalek::SigningKey;
+    /// use rcan::{Delegation, Expires};
+    ///
+    /// let key = SigningKey::from_bytes(&[0u8; 32]);
+    /// let bytes = Delegation::issue(&key, key.verifying_key(), &7u32, Expires::Never).encode();
+    ///
+    /// let unverified = Delegation::<u32>::decode_unverified(&bytes).unwrap();
+    /// assert_eq!(unverified.issuer(), &key.verifying_key());
+    /// let delegation = unverified.verify().unwrap();
+    /// assert_eq!(delegation.capability(), 7);
+    /// ```
+    ///
+    /// [`decode`]: Delegation::decode
+    /// [`verify`]: UnverifiedDelegation::verify
+    pub fn decode_unverified(bytes: &[u8]) -> Result<UnverifiedDelegation<C>, DecodeError> {
         match bytes.split_first() {
             None => Err(DecodeError::malformed("token is empty")),
             Some((0x01, _)) | Some((0x20, _)) => Err(e!(DecodeError::UnsupportedV1)),
-            Some((0x02, bytes)) => decode_v2_checked::<C>(bytes),
+            Some((0x02, bytes)) => decode_v2(bytes),
             Some((v, _)) => Err(DecodeError::malformed(format!(
                 "unknown version byte {:#x}",
                 v
@@ -347,6 +396,85 @@ impl<'de, C: CapabilityEncoding> Deserialize<'de> for Delegation<C> {
             Self::decode(&bytes)
         };
         delegation.map_err(D::Error::custom)
+    }
+}
+
+/// A decoded delegation whose signature is not verified yet.
+///
+/// [`Delegation::decode_unverified`] returns it. Its getters return values
+/// that are not authenticated. The only way to a [`Delegation`] is [`verify`].
+///
+/// [`verify`]: UnverifiedDelegation::verify
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnverifiedDelegation<C = OpaqueCapability>(Delegation<C>);
+
+impl<C> UnverifiedDelegation<C> {
+    /// Returns the signature, not verified.
+    pub fn signature(&self) -> &Signature {
+        self.0.signature()
+    }
+
+    /// Returns the public key of the issuer, not authenticated.
+    pub fn issuer(&self) -> &VerifyingKey {
+        self.0.issuer()
+    }
+
+    /// Returns the public key of the audience, not authenticated.
+    pub fn audience(&self) -> &VerifyingKey {
+        self.0.audience()
+    }
+
+    /// Returns the origin of the capability, not authenticated.
+    pub fn capability_origin(&self) -> &CapabilityOrigin {
+        self.0.capability_origin()
+    }
+
+    /// Returns the owner of the capability, not authenticated.
+    ///
+    /// Returns `None` for an auto-delegation, as
+    /// [`Delegation::capability_owner`] does.
+    pub fn capability_owner(&self) -> Option<&VerifyingKey> {
+        self.0.capability_owner()
+    }
+
+    /// Returns when the delegation expires, not authenticated.
+    pub fn expires(&self) -> &Expires {
+        self.0.expires()
+    }
+
+    /// Returns the encoded capability bytes, not authenticated.
+    pub fn capability_bytes(&self) -> &[u8] {
+        self.0.capability_bytes()
+    }
+
+    /// Returns the message that the issuer signs.
+    ///
+    /// See [`Delegation::signed_message`].
+    pub fn signed_message(&self) -> Vec<u8> {
+        self.0.signed_message()
+    }
+
+    /// Verifies the signature and returns the delegation.
+    ///
+    /// The check is `verify_strict` of `ed25519-dalek`, as in
+    /// [`Delegation::decode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::InvalidSignature`] if the signature is invalid.
+    pub fn verify(self) -> Result<Delegation<C>, DecodeError> {
+        self.0
+            .issuer
+            .verify_strict(&self.0.message(), &self.0.signature)
+            .map_err(|_| e!(DecodeError::InvalidSignature))?;
+        Ok(self.0)
+    }
+}
+
+impl<C: CapabilityEncoding> UnverifiedDelegation<C> {
+    /// Decodes and returns the capability, not authenticated.
+    pub fn capability(&self) -> C {
+        self.0.capability()
     }
 }
 
@@ -681,7 +809,7 @@ fn encode_body<C>(delegation: &Delegation<C>, out: &mut impl Extend<u8>) {
     out.extend(delegation.capability_bytes.iter().copied());
 }
 
-fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C>, DecodeError> {
+fn decode_v2<C: CapabilityEncoding>(bytes: &[u8]) -> Result<UnverifiedDelegation<C>, DecodeError> {
     if bytes.len() < SIGNATURE_LENGTH {
         return Err(DecodeError::malformed("invalid signature length"));
     }
@@ -696,20 +824,10 @@ fn decode_v2_checked<C: CapabilityEncoding>(bytes: &[u8]) -> Result<Delegation<C
             .try_into()
             .map_err(|_| DecodeError::malformed("invalid signature length"))?,
     );
-    let mut to_verify = SmallVec::<[u8; 192]>::from_slice(DST);
-    to_verify.extend_from_slice(body_bytes);
-    delegation
-        .issuer
-        .verify_strict(&to_verify, &signature)
-        .map_err(|_| e!(DecodeError::InvalidSignature))?;
-    Ok(Delegation::new(
-        delegation.issuer,
-        delegation.audience,
-        delegation.capability_origin,
-        delegation.valid_until,
-        delegation.capability_bytes,
+    Ok(UnverifiedDelegation(Delegation {
         signature,
-    ))
+        ..delegation
+    }))
 }
 
 fn decode_body<C: CapabilityEncoding>(buf: &mut &[u8]) -> Result<Delegation<C>, DecodeError> {
