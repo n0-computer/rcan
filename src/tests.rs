@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Authorizer, Capability, DecodeError, Delegation, Expires, InvocationError, OpaqueCapability,
-    BASE32_LOWER_NOPAD,
+    BASE32_LOWER_NOPAD, DST,
 };
 
 /// An example capability type for testing.
@@ -211,6 +211,93 @@ fn v2_decode_rejects_tampering() {
 
     let err = Delegation::<Rpc>::decode(&[]).unwrap_err();
     assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("empty"));
+}
+
+#[test]
+fn decode_unverified_then_verify() {
+    let good = delegation();
+    let bytes = good.encode();
+
+    let unverified = Delegation::<Rpc>::decode_unverified(&bytes).unwrap();
+    assert_eq!(unverified.signature(), good.signature());
+    assert_eq!(unverified.issuer(), good.issuer());
+    assert_eq!(unverified.audience(), good.audience());
+    assert_eq!(unverified.capability_origin(), good.capability_origin());
+    assert_eq!(unverified.capability_owner(), good.capability_owner());
+    assert_eq!(unverified.expires(), good.expires());
+    assert_eq!(unverified.capability_bytes(), good.capability_bytes());
+    assert_eq!(unverified.capability(), good.capability());
+    assert_eq!(unverified.verify().unwrap(), good);
+
+    // A bad signature passes the decode, and fails the explicit check.
+    let mut forged = bytes.clone();
+    let n = forged.len();
+    forged[n - SIGNATURE_LENGTH..].fill(0);
+    let unverified = Delegation::<Rpc>::decode_unverified(&forged).unwrap();
+    assert_eq!(unverified.issuer(), good.issuer());
+    let err = unverified.verify().unwrap_err();
+    assert_matches!(err, DecodeError::InvalidSignature { .. });
+
+    // So does a changed payload: the signature covers every payload byte.
+    let mut widened = bytes.clone();
+    let capability_offset = 1 + 32 + 32 + 1 + 6 + 1;
+    assert_eq!(widened[capability_offset], 1);
+    widened[capability_offset] = 2;
+    let unverified = Delegation::<Rpc>::decode_unverified(&widened).unwrap();
+    assert_eq!(unverified.capability(), Rpc::All);
+    let err = unverified.verify().unwrap_err();
+    assert_matches!(err, DecodeError::InvalidSignature { .. });
+}
+
+#[test]
+fn signed_message_is_dst_and_payload() {
+    for wire in [V2_POSTCARD, V2_NEVER, V2_AUTO] {
+        let bytes = hexdump(wire);
+        let payload = &bytes[1..bytes.len() - SIGNATURE_LENGTH];
+        let expected = [DST, payload].concat();
+        let unverified = Delegation::<Rpc>::decode_unverified(&bytes).unwrap();
+        assert_eq!(unverified.signed_message(), expected);
+        let delegation = unverified.verify().unwrap();
+        assert_eq!(delegation.signed_message(), expected);
+        // The issuer's signature is over exactly this message.
+        delegation
+            .issuer()
+            .verify_strict(&expected, delegation.signature())
+            .unwrap();
+    }
+}
+
+#[test]
+fn decode_unverified_checks_structure() {
+    let good = delegation().encode();
+
+    let mut padded = good.clone();
+    let signature_start = padded.len() - SIGNATURE_LENGTH;
+    padded.insert(signature_start, 0);
+    let err = Delegation::<Rpc>::decode_unverified(&padded).unwrap_err();
+    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("canonical"));
+
+    let mut overlong = good.clone();
+    let origin_offset = 1 + 32 + 32;
+    overlong[origin_offset] = 0x80;
+    overlong.insert(origin_offset + 1, 0x00);
+    let err = Delegation::<Rpc>::decode_unverified(&overlong).unwrap_err();
+    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("non-canonical"));
+
+    let mut versioned = good.clone();
+    versioned[0] = 3;
+    let err = Delegation::<Rpc>::decode_unverified(&versioned).unwrap_err();
+    assert_matches!(&err, DecodeError::Malformed { reason, .. } if reason.contains("version"));
+
+    let err = Delegation::<Rpc>::decode_unverified(&[0x01; 8]).unwrap_err();
+    assert_matches!(err, DecodeError::UnsupportedV1 { .. });
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct OtherCapability {
+        topic: String,
+    }
+    let err = Delegation::<OtherCapability>::decode_unverified(&good).unwrap_err();
+    assert_matches!(err, DecodeError::WrongCapability { .. });
 }
 
 #[test]
